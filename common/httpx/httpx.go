@@ -280,7 +280,7 @@ get_response:
 
 	if h.Options.MaxResponseBodySizeToRead > 0 {
 		if httpresp.ContentLength > h.Options.MaxResponseBodySizeToRead {
-			httpresp.ContentLength = -1 // body is about to be truncated by the read cap
+			httpresp.ContentLength = -1 // mark the length unknown so the response dump accepts the capped body
 		}
 		httpresp.Body = io.NopCloser(io.LimitReader(httpresp.Body, h.Options.MaxResponseBodySizeToRead))
 		if !shouldSkipBodyRead {
@@ -521,9 +521,28 @@ func (h *HTTPX) SetCustomHeaders(r *retryablehttp.Request, headers map[string][]
 
 func (httpx *HTTPX) setCustomCookies(req *http.Request) {
 	if httpx.Options.hasCustomCookies() {
+		// the names the configured cookies replace
+		replaced := make(map[string]struct{}, len(httpx.Options.customCookies))
+		for _, cookie := range httpx.Options.customCookies {
+			replaced[cookie.Name] = struct{}{}
+		}
+		// keep every cookie already on the request that is not being replaced: the
+		// follow redirect flow carries over the cookie header of the previous hop,
+		// which also holds cookies applied by an auth strategy
+		existingCookies := req.Cookies()
+		preservedCookies := make([]*http.Cookie, 0, len(existingCookies))
+		for _, cookie := range existingCookies {
+			if _, isReplaced := replaced[cookie.Name]; !isReplaced {
+				preservedCookies = append(preservedCookies, cookie)
+			}
+		}
 		// reset any cookie header carried over from the previous hop so the
-		// configured cookies are applied exactly once
+		// configured cookies are applied exactly once, then restore the cookies
+		// that are not being replaced before adding the configured ones
 		req.Header.Del("Cookie")
+		for _, cookie := range preservedCookies {
+			req.AddCookie(cookie)
+		}
 		for _, cookie := range httpx.Options.customCookies {
 			req.AddCookie(cookie)
 		}
