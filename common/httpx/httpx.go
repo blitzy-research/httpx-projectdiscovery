@@ -279,6 +279,9 @@ get_response:
 	shouldSkipBodyRead := generic.EqualsAny(httpresp.StatusCode, http.StatusSwitchingProtocols, http.StatusNotModified)
 
 	if h.Options.MaxResponseBodySizeToRead > 0 {
+		if httpresp.ContentLength > h.Options.MaxResponseBodySizeToRead {
+			httpresp.ContentLength = -1 // body is about to be truncated by the read cap
+		}
 		httpresp.Body = io.NopCloser(io.LimitReader(httpresp.Body, h.Options.MaxResponseBodySizeToRead))
 		if !shouldSkipBodyRead {
 			defer func() {
@@ -518,6 +521,9 @@ func (h *HTTPX) SetCustomHeaders(r *retryablehttp.Request, headers map[string][]
 
 func (httpx *HTTPX) setCustomCookies(req *http.Request) {
 	if httpx.Options.hasCustomCookies() {
+		// reset any cookie header carried over from the previous hop so the
+		// configured cookies are applied exactly once
+		req.Header.Del("Cookie")
 		for _, cookie := range httpx.Options.customCookies {
 			req.AddCookie(cookie)
 		}
