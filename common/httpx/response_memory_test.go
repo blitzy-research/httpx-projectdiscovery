@@ -190,48 +190,15 @@ func TestBodyMetricsCountingDoesNotAllocate(t *testing.T) {
 	require.Zerof(t, allocs, "word/line counting must not allocate, got %v allocs/op", allocs)
 }
 
-// TestDoBodyReadCapTruncatesOversizeBody is the motivating failing case for the
-// ContentLength guard inside Do's read-cap branch: a response whose origin DECLARES
-// more bytes than MaxResponseBodySizeToRead allows must be TRUNCATED, never dropped.
+// TestDoBodyReadCapTruncatesOversizeBody verifies that a declared body larger than
+// the read cap is returned as a truncated response rather than rejected for a
+// Content-Length mismatch. Do marks the upstream length unknown before
+// serialization, while the caller-facing ContentLength is reconstructed from the
+// preserved Content-Length header.
 //
-// Before that guard existed the body was wrapped in an io.LimitReader while the
-// upstream *http.Response kept ContentLength=100, so the full-response
-// serialization inside pdhttputil.DumpResponseHeadersAndRaw failed its own length
-// check with "http: ContentLength=100 with Body length 10" and Do returned NO
-// RESPONSE AT ALL - the target vanished from output entirely. Three independent
-// contracts in this repository document the option as a read cap, i.e. truncation
-// rather than a hard failure: the -rstr flag help text ("max response size to read
-// in bytes"), the DefaultMaxResponseBodySize doc comment in option.go (which speaks
-// of what httpx "reads into memory" and points at -rstr/-rsts to read or store
-// larger responses), and the specification's description of Do capping the
-// in-memory response body read. TestDoBodyReadCapChunkedTruncation is the companion
-// proving the guard is inert on the path that already worked.
-//
-// Every value asserted here was measured against the current code and is stable
-// across repeated runs: Date is a fixed-length IMF-fixdate and the handler pins
-// Content-Type, so MIME sniffing cannot widen the dump (leaving Content-Type to the
-// sniffer yields "text/plain; charset=utf-8", 15 bytes longer, and turns the
-// far-over-the-cap dump from 111 bytes into 126).
-//
-// Note that only the UPSTREAM ContentLength field is invalidated. resp.ContentLength
-// is recomputed by Do from the preserved Headers["Content-Length"] entry, so in every
-// case below the caller observes the 100 bytes the origin declared even when the cap
-// let it keep far fewer - deliberately, not contradictorily.
-//
-// Raising the cap without touching newLocalHTTPX is safe and is what keeps the
-// helper untouched: newLocalHTTPX copies DefaultOptions by VALUE and New retains a
-// pointer to that copy, while Do reads MaxResponseBodySizeToRead at request time.
-// Assigning through ht.Options therefore reconfigures this client alone and cannot
-// corrupt the package-level DefaultOptions every other test reads.
-//
-// The cap is swept across its whole boundary rather than sampled at one point,
-// because an off-by-one in the guard is exactly the plausible defect this test has to
-// catch. Below the cap and EXACTLY AT it nothing may change - the declared length is
-// still honourable, so the dump must keep framing the body with it - while one byte
-// over is where truncation and connection-close framing begin. A guard written with
-// >= instead of > would pass every assertion about the bytes and fail only on the
-// at-the-cap framing, which is why that case asserts the Content-Length line
-// explicitly rather than just the body.
+// The cases straddle the strict > guard: lengths at or below the cap retain declared
+// framing; lengths above it are close-delimited. This catches an off-by-one change
+// without relying only on retained body bytes.
 func TestDoBodyReadCapTruncatesOversizeBody(t *testing.T) {
 	// 100 bytes whose first 10 are recognizable, so the assertions prove the cap
 	// kept the PREFIX rather than merely N bytes from somewhere in the body.
@@ -243,14 +210,11 @@ func TestDoBodyReadCapTruncatesOversizeBody(t *testing.T) {
 	// + 37 (Date) + 2 (blank line) + N (body). Truncated: the same minus the
 	// 21-byte Content-Length line, which the dump can no longer honour.
 	for _, tc := range []struct {
-		name string
-		// readCap rather than cap, which would shadow the builtin.
-		readCap       int64
-		wantData      []byte
-		wantRaw       int
-		wantRawHeader int
-		// wantDeclaredFraming is true while the dump can still frame the body with
-		// the length the origin declared.
+		name                string
+		readCap             int64
+		wantData            []byte
+		wantRaw             int
+		wantRawHeader       int
 		wantDeclaredFraming bool
 	}{
 		{name: "below the cap", readCap: 200, wantData: body, wantRaw: 222, wantRawHeader: 122, wantDeclaredFraming: true},
@@ -260,8 +224,8 @@ func TestDoBodyReadCapTruncatesOversizeBody(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				// Content-Length is the field the pre-fix defect keyed on;
-				// Content-Type is pinned so the dump length is free of MIME sniffing.
+				// Pin Content-Type so raw lengths do not depend on MIME sniffing;
+				// Content-Length drives the declared-length branch under test.
 				w.Header().Set("Content-Type", "text/plain")
 				w.Header().Set("Content-Length", "100")
 				_, _ = w.Write(body)
@@ -271,8 +235,7 @@ func TestDoBodyReadCapTruncatesOversizeBody(t *testing.T) {
 			ht := newLocalHTTPX(t)
 			ht.Options.MaxResponseBodySizeToRead = tc.readCap
 
-			// doLocal asserts no error, which is itself the regression guard: the
-			// truncating cases used to fail outright instead of returning a response.
+			// doLocal's no-error assertion requires capped responses to remain usable.
 			resp := doLocal(t, ht, ts.URL)
 
 			require.Equal(t, http.StatusOK, resp.StatusCode, "a truncated body is still a successful response")
@@ -295,10 +258,9 @@ func TestDoBodyReadCapTruncatesOversizeBody(t *testing.T) {
 				require.Contains(t, resp.Raw, "\r\nContent-Length: 100\r\n",
 					"an untruncated body must still be framed by the length the origin declared")
 			} else {
-				// With the declared length invalidated the dump frames the truncated
-				// body by connection close instead of by a length it cannot honour. A
-				// regression that rewrote the HEADER rather than the field would
-				// surface here as a stale or shrunken Content-Length line.
+				// Once the upstream length is unknown, the dump must be close-delimited;
+				// the cloned response header must remain unchanged for caller-visible
+				// metadata.
 				require.NotContains(t, resp.Raw, "Content-Length",
 					"a truncated body must not be framed by a declared length")
 			}
@@ -311,28 +273,13 @@ func TestDoBodyReadCapTruncatesOversizeBody(t *testing.T) {
 	}
 }
 
-// TestDoBodyReadCapChunkedTruncation pins the read cap on the path that always
-// worked, and is the control for TestDoBodyReadCapTruncatesOversizeBody: every value
-// below is byte-identical to the pre-guard baseline, so it proves the ContentLength
-// guard in Do is completely inert here.
-//
-// It is inert by construction rather than by luck. A chunked response carries no
-// Content-Length, so net/http hands Do an upstream ContentLength of -1; the guard's
-// "declared length exceeds the cap" test is therefore false and its assignment never
-// fires. The caller-visible ContentLength of 100 consequently comes from a different
-// place than in the declared-length case: Do's header lookup finds no
-// Content-Length entry, so it falls back to len(respbody) - which is the TRUNCATED
-// length, not the origin's real 40,000 bytes. Asserting the absent header through
-// the accessor is what makes that provenance visible instead of implied.
-//
-// The dump length is independent of how large the payload actually is (measured
-// identical for 40,000, 42,000 and 1,080,000-byte bodies), because only the retained
-// bytes are ever serialized.
+// TestDoBodyReadCapChunkedTruncation verifies the cap for an undeclared-length
+// response. net/http reports a chunked response with ContentLength -1, so the
+// declared-length guard is inert; because no Content-Length header exists, the
+// caller-facing value falls back to the retained body length.
 func TestDoBodyReadCapChunkedTruncation(t *testing.T) {
-	// Generated at runtime rather than stored as a fixture, following the
-	// bytes.Repeat precedent in TestBodyMetricsCountingDoesNotAllocate. 25 bytes per
-	// unit means the 100-byte cap lands exactly on a line boundary, which is what
-	// makes the word and line counts below exact rather than incidental.
+	// Each 25-byte unit makes the 100-byte cap end on a line boundary, so the word and
+	// line counts are exact.
 	payload := bytes.Repeat([]byte("chunked response payload\n"), 1600)
 	require.Len(t, payload, 40000, "precondition: the origin delivers exactly 40000 bytes")
 
@@ -375,32 +322,14 @@ func TestDoBodyReadCapChunkedTruncation(t *testing.T) {
 	require.Equal(t, 4, resp.Lines)
 }
 
-// TestDoBodyNotModifiedSkipsBodyRead pins the body-skip path: Do computes
-// shouldSkipBodyRead with generic.EqualsAny over 101 Switching Protocols and 304 Not
-// Modified, and for those two statuses it never reads a body at all.
+// TestDoBodyNotModifiedSkipsBodyRead verifies the 304 branch of shouldSkipBodyRead. A
+// conforming 304 has no message body (RFC 9110 §15.4.5), and net/http suppresses
+// Content-Type, Content-Length and Transfer-Encoding; this fixture's dump therefore
+// contains Connection: close, Date, Etag and the header terminator.
 //
-// RFC 9110 section 15.4.5 specifies that a 304 carries no message body, and RFC 7232
-// section 4.1 is why net/http's server additionally suppresses Content-Type,
-// Content-Length and Transfer-Encoding for it - so against a conforming origin the
-// response headers are exactly the validator plus Date and the full dump is
-// byte-identical to the header-only dump. The word and line counts are zero because
-// Do's counting is guarded by len(respbody) > 0, the same reason TestDoBodyEmpty
-// asserts 0 and 0.
-//
-// The validator is asserted through GetHeader with the CANONICAL spelling "Etag".
-// Response.Headers is a plain map[string][]string and GetHeader is a raw map read
-// with no canonicalization, so the lookup is case-sensitive: net/http stores the
-// handler's "ETag" under textproto's canonical "Etag", and "ETag" would silently
-// return the empty string.
-//
-// The two sub-tests are not redundant, and the second is what gives this test its
-// teeth. Against a conforming origin the skip is INVISIBLE: a real 304 carries no
-// body, so an implementation that dutifully read it would still produce an empty one
-// and every assertion would pass anyway. Only a response that carries bytes behind
-// the status can tell "Do skipped the read" apart from "there was nothing to read",
-// and no loopback server can produce that - net/http's server suppresses a body for
-// a 304 by design. Serving it from the mock transport is therefore the only way to
-// pin the branch itself.
+// GetHeader requires the stored MIME spelling "Etag". The mock subtest supplies
+// non-conforming body bytes because a loopback net/http server suppresses them; this
+// distinguishes skipping the read from merely receiving no body.
 func TestDoBodyNotModifiedSkipsBodyRead(t *testing.T) {
 	const validator = `"abc123"` // a quoted entity-tag, per RFC 9110 section 8.8.3
 
@@ -470,41 +399,18 @@ func TestDoBodyNotModifiedSkipsBodyRead(t *testing.T) {
 	})
 }
 
-// TestDoBodyGzipInvalidHeaderRetriesWithIdentity pins Do's one-shot content-encoding
-// retry: when a response is LABELLED with a compressed encoding but its body cannot
-// be decoded, Do rewrites Accept-Encoding to identity and reissues the request
-// exactly once, guarded by an internal flag so a second failure is not retried.
+// TestDoBodyGzipInvalidHeaderRetriesWithIdentity verifies that an invalid gzip body
+// causes one retry with Accept-Encoding: identity. The mock injects gzip.ErrHeader
+// because transparent decompression normally occurs in the replaced http.Transport, and
+// the initial request sets gzip explicitly for the same reason.
 //
-// The failure is injected rather than produced, because the transparent
-// decompression that raises it in production lives in the http.Transport this test
-// replaces. errReadCloser paired with gzip.ErrHeader reproduces it faithfully:
-// gzip.ErrHeader is precisely "gzip: invalid header", the substring Do matches on.
-//
-// Accept-Encoding is set explicitly on the request for the same reason - a custom
-// RoundTripper bypasses http.Transport's automatic encoding negotiation, so hop 1
-// would otherwise carry no Accept-Encoding at all. Setting it makes the per-hop
-// assertion sharper rather than weaker: hop 1 carries exactly what the caller asked
-// for, and hop 2 carries identity only because Do overwrote it.
-//
-// The most telling assertion in the first sub-test is the last one. Do rewrites the
-// header on the CALLER'S OWN request object, so the retry is observable from outside
-// the call: a caller that inspects its request after Do returns sees identity, not
-// the gzip it set. That is a protocol-visible side effect, and a refactor that
-// retried on a copy would fail there while leaving every response assertion green.
-//
-// The second sub-test pins the one-shot guard, which the first cannot reach: once the
-// identity attempt succeeds there is no second failure to retry, so an
-// implementation that never armed the guard would look identical. Scripting two
-// consecutive failures followed by a success separates them by round-trip count
-// alone - a correct client stops at two and surfaces the error, while an unguarded
-// one retries again and "recovers" on the third.
+// The first subtest pins the caller-visible mutation of req.Header. The second returns
+// two decode failures so the !gzipRetry guard must surface the second error instead of
+// issuing a third request.
 func TestDoBodyGzipInvalidHeaderRetriesWithIdentity(t *testing.T) {
 	const plainBody = "plain-not-gzipped-x" // exactly 19 bytes, never gzip-compressed
 	require.Len(t, plainBody, 19, "precondition: the payload is exactly 19 bytes")
 
-	// A response LABELLED gzip whose body yields no byte and fails with the exact
-	// error the standard library's gzip reader reports. Shared by both sub-tests as a
-	// local closure rather than a package-level helper, since nothing else needs it.
 	invalidGzip := func(r *http.Request) *http.Response {
 		resp := mockResponse(r, http.StatusOK,
 			http.Header{"Content-Encoding": {"gzip"}, "Content-Type": {"text/plain"}}, "")
@@ -532,7 +438,6 @@ func TestDoBodyGzipInvalidHeaderRetriesWithIdentity(t *testing.T) {
 		resp, err := ht.Do(req, UnsafeOptions{})
 		require.NoError(t, err)
 
-		// Exactly two round trips: the retry reissues the request once, not in a loop.
 		require.Equal(t, 2, rt.callCount(), "the encoding retry must reissue the request exactly once")
 		hops := rt.requests()
 		require.Len(t, hops, 2)
@@ -561,8 +466,6 @@ func TestDoBodyGzipInvalidHeaderRetriesWithIdentity(t *testing.T) {
 		// exactly the symptom of a retry loop.
 		const recovered = "third-attempt-body"
 
-		// The handler consults the transport it belongs to, so it is declared before
-		// being assigned. callCount is atomic, which keeps the read race-free.
 		var rt *mockTransport
 		rt = newMockTransport(t, func(r *http.Request) (*http.Response, error) {
 			if rt.callCount() > 2 {
