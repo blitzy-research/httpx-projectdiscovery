@@ -157,7 +157,8 @@ func (rec *requestBodyRecorder) record(r *http.Request) []byte {
 		ContentLength:    r.ContentLength,
 		ContentLengthHdr: r.Header.Get("Content-Length"),
 		// append to a nil slice preserves nil for an absent Transfer-Encoding, which is
-		// the value the "never chunked" assertions expect.
+		// the value the length-delimited cases assert; a chunk-delimited request is
+		// recorded as the one-element slice []string{"chunked"}.
 		TransferEncoding: append([]string(nil), r.TransferEncoding...),
 		Body:             body,
 	}
@@ -269,30 +270,75 @@ func TestRequestBodyForwardedExactly(t *testing.T) {
 }
 
 // TestRequestBodyBufferedRegardlessOfReaderType is the counter-intuitive result that makes
-// this file valuable: a length-bearing reader and a reader that exposes NO length produce
-// byte-for-byte IDENTICAL framing on the wire, and chunked framing never occurs for either.
+// this file valuable: for a payload of NON-ZERO length, a length-bearing reader and a reader
+// that exposes NO length produce byte-for-byte IDENTICAL framing on the wire, and chunked
+// framing never occurs for either. The table then pins the single input class that IS
+// chunked, which is what keeps the "never chunked" rows a real discrimination rather than an
+// unfalsifiable slogan.
 //
 // WHY, precisely. retryablehttp's constructor does not hand the caller's reader to
-// net/http. getReusableBodyandContentLength (retryablehttp-go@v1.3.18/util.go:31-72) wraps
+// net/http. getReusableBodyandContentLength (retryablehttp-go@v1.3.18/util.go:31-73) wraps
 // ANY body in readerutil.NewReusableReadCloser, which buffers every input kind into a
-// bytes.Buffer (projectdiscovery/utils@v0.11.1/reader/reusable_read_closer.go:20-70,
-// including the generic io.Reader case), and then measures the length by draining that
-// buffer with io.Copy. So an exact Content-Length is ALWAYS available by the time net/http
-// serializes the request, and net/http therefore never needs a transfer coding.
+// bytes.Buffer (projectdiscovery/utils@v0.11.1/reader/reusable_read_closer.go, including the
+// generic io.Reader case), and then measures the length by draining that buffer with
+// io.Copy. So for a body of non-zero length an exact Content-Length is available by the time
+// net/http serializes the request, and net/http therefore needs no transfer coding.
+//
+// THE ONE EXCEPTION, measured and pinned by the last two rows: a body that is NOT nil but
+// buffers to ZERO bytes is sent with Transfer-Encoding: chunked and no Content-Length line
+// at all. Buffering alone is therefore not what guarantees a declared length - a buffered
+// body of non-zero length is. The mechanism is entirely inside the standard library and has
+// nothing to do with streaming:
+//
+//   - Request.outgoingLength (go1.26.5 net/http/request.go:1552-1560) cannot tell "length 0,
+//     known" apart from "length unknown" on a non-nil Body, so it maps
+//     (Body != nil && ContentLength == 0) to -1, meaning unknown.
+//   - newTransferWriter (net/http/transfer.go:95-96) takes that -1 and consults
+//     shouldSendChunkedRequestBody (net/http/transfer.go:170-191), which returns true at
+//     :190 WITHOUT probing the body for a POST, because requestMethodUsuallyLacksBody
+//     (net/http/request.go:1569-1575) covers only GET/HEAD/DELETE/OPTIONS/PROPFIND/SEARCH.
+//
+// RFC 9112 section 6.3 leaves no alternative once the length is unknown: a request whose
+// message declares neither a length nor a transfer coding has no body at all, so chunked
+// framing is the only correct way to send one. The behaviour is therefore CORRECT, not a
+// defect, and it is pinned here rather than reported - the same divergence protocol the
+// sibling per-hop framing assertions use. The measured raw wire, captured on a bare
+// net.Listen socket, is exactly:
+//
+//	POST /probe HTTP/1.1\r\nHost: 127.0.0.1:...\r\nUser-Agent: Go-http-client/1.1\r\n
+//	Transfer-Encoding: chunked\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n0\r\n\r\n
+//
+// httpx's own scanning path cannot reach it: runner/runner.go:1912 and :1939 attach a body
+// only when scanopts.RequestBody != "", and HTTPX.NewRequestWithContext
+// (common/httpx/httpx.go:462-480) passes a nil body. A LIBRARY CALLER can reach it, and a
+// silent framing change on this path is the same class of defect as an unwanted chunked body
+// anywhere else - some origins and WAFs reject chunked requests - so it is asserted rather
+// than merely described.
 //
 // That makes the assertions below sharp rather than incidental. If someone replaced the
-// buffering with a streaming body - passing the caller's reader straight through - the
-// length would become unknown, net/http would fall back to Transfer-Encoding: chunked and
-// report ContentLength -1, and every row of this table would fail immediately. The control
-// sub-test proves that is a real, observable alternative and not a hypothetical: the SAME
-// opaqueBodyReader sent through net/http WITHOUT the retry layer, against the same kind of
-// loopback server, was MEASURED to arrive chunked with ContentLength -1 and no
-// Content-Length header at all.
+// buffering with a streaming body - passing the caller's reader straight through - the length
+// of every non-empty row would become unknown, net/http would fall back to
+// Transfer-Encoding: chunked and report ContentLength -1, and those rows would fail
+// immediately. The control sub-test proves that is a real, observable alternative and not a
+// hypothetical: the SAME opaqueBodyReader carrying the SAME 13 bytes, sent through net/http
+// WITHOUT the retry layer against the same kind of loopback server, was MEASURED to arrive
+// chunked with ContentLength -1 and no Content-Length header at all.
 //
-// MEASURED per row: 13/"13", 13/"13" and 0/"0", with TransferEncoding nil in all three.
+// MEASURED per row - client-side length / Content-Length line at the origin / length parsed
+// at the origin / transfer coding:
+//
+//	length-bearing reader        13 / "13" / 13 / none
+//	opaque reader with no length 13 / "13" / 13 / none
+//	nil body                      0 / "0"  /  0 / none
+//	empty non-nil reader          0 / ""   / -1 / chunked
+//	empty non-nil opaque reader   0 / ""   / -1 / chunked
+//
 // The nil-body row is worth stating explicitly - net/http emits Content-Length: 0 rather
 // than omitting the header, which RFC 9110 section 8.6 permits for a bodyless request with
-// a method that defines body semantics.
+// a method that defines body semantics - and, read against the two rows below it, it is what
+// shows the discriminator is nil-ness rather than size: a nil body takes the Body == nil
+// branch of outgoingLength and is length-delimited, while a non-nil body of the same zero
+// size is not.
 func TestRequestBodyBufferedRegardlessOfReaderType(t *testing.T) {
 	require.Len(t, requestBodyPayload, 13, "precondition: the request payload is exactly 13 bytes")
 
@@ -301,34 +347,87 @@ func TestRequestBodyBufferedRegardlessOfReaderType(t *testing.T) {
 		// newBody builds a fresh body per row. It is a constructor rather than a value
 		// because a reader is consumed by the request that uses it.
 		newBody func() io.Reader
-		// wantContentLengthHdr is the exact Content-Length line the origin must observe.
+		// wantRequestBodyPresent is whether the constructed request carries a body at all.
+		// It is the discriminator the whole framing decision hinges on: outgoingLength
+		// returns a definite 0 for a nil Body and -1 (unknown) for a non-nil Body whose
+		// length is 0, which is why the nil row is length-delimited and the empty non-nil
+		// rows are chunked.
+		wantRequestBodyPresent bool
+		// wantContentLengthHdr is the exact Content-Length line the origin must observe;
+		// empty for a chunk-delimited message, which declares no length at all.
 		wantContentLengthHdr string
-		wantContentLength    int64
+		// wantContentLength is the length the CONSTRUCTOR computes on the client request,
+		// before anything is serialized. Because the server echoes the body back verbatim it
+		// is also the caller-visible length of the response, so it is asserted at both ends.
+		wantContentLength int64
+		// wantOriginContentLength is the framing value net/http PARSED at the origin: the
+		// declared length for a length-delimited message, -1 for a chunk-delimited one. It
+		// differs from wantContentLength only for a body that is non-nil yet empty.
+		wantOriginContentLength int64
+		// wantTransferEncoding is the transfer coding the origin must observe: nil for a
+		// length-delimited message, []string{"chunked"} for a non-nil empty body.
+		wantTransferEncoding []string
 		wantBody             []byte
 	}{
 		{
-			name:                 "length-bearing reader",
-			newBody:              func() io.Reader { return strings.NewReader(requestBodyPayload) },
-			wantContentLengthHdr: "13",
-			wantContentLength:    13,
-			wantBody:             []byte(requestBodyPayload),
+			name:                    "length-bearing reader",
+			newBody:                 func() io.Reader { return strings.NewReader(requestBodyPayload) },
+			wantRequestBodyPresent:  true,
+			wantContentLengthHdr:    "13",
+			wantContentLength:       13,
+			wantOriginContentLength: 13,
+			wantBody:                []byte(requestBodyPayload),
 		},
 		{
 			// The discriminating row: the concrete type offers neither Len nor Size, so
 			// nothing short of consuming it can reveal the length - and the framing is
 			// nonetheless identical to the row above.
-			name:                 "opaque reader with no length",
-			newBody:              func() io.Reader { return opaqueBodyReader{r: strings.NewReader(requestBodyPayload)} },
-			wantContentLengthHdr: "13",
-			wantContentLength:    13,
-			wantBody:             []byte(requestBodyPayload),
+			name:                    "opaque reader with no length",
+			newBody:                 func() io.Reader { return opaqueBodyReader{r: strings.NewReader(requestBodyPayload)} },
+			wantRequestBodyPresent:  true,
+			wantContentLengthHdr:    "13",
+			wantContentLength:       13,
+			wantOriginContentLength: 13,
+			wantBody:                []byte(requestBodyPayload),
 		},
 		{
-			name:                 "nil body",
-			newBody:              func() io.Reader { return nil },
-			wantContentLengthHdr: "0",
-			wantContentLength:    0,
-			wantBody:             []byte{},
+			name:                    "nil body",
+			newBody:                 func() io.Reader { return nil },
+			wantRequestBodyPresent:  false,
+			wantContentLengthHdr:    "0",
+			wantContentLength:       0,
+			wantOriginContentLength: 0,
+			wantBody:                []byte{},
+		},
+		{
+			// The divergent row, and the reason the rows above are a real discrimination:
+			// this body is NOT nil but buffers to zero bytes, so outgoingLength reports its
+			// length as unknown and net/http frames the request as chunked. It is the ONLY
+			// input class this client chunks, it is the one dimension the framing rule above
+			// does not cover, and an unnoticed change here would be exactly as harmful as an
+			// unwanted chunked body on any other path - which is why it is asserted.
+			name:                    "empty non-nil reader",
+			newBody:                 func() io.Reader { return strings.NewReader("") },
+			wantRequestBodyPresent:  true,
+			wantContentLengthHdr:    "",
+			wantContentLength:       0,
+			wantOriginContentLength: -1,
+			wantTransferEncoding:    []string{"chunked"},
+			wantBody:                []byte{},
+		},
+		{
+			// The same zero-length payload behind a type that exposes no length. Its framing
+			// is identical to the row above, which shows the divergence is driven by the
+			// buffered SIZE and not by the reader's concrete type - the same conclusion the
+			// two 13-byte rows establish for the length-delimited case.
+			name:                    "empty non-nil opaque reader",
+			newBody:                 func() io.Reader { return opaqueBodyReader{r: strings.NewReader("")} },
+			wantRequestBodyPresent:  true,
+			wantContentLengthHdr:    "",
+			wantContentLength:       0,
+			wantOriginContentLength: -1,
+			wantTransferEncoding:    []string{"chunked"},
+			wantBody:                []byte{},
 		},
 	}
 
@@ -354,6 +453,8 @@ func TestRequestBodyBufferedRegardlessOfReaderType(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, tc.wantContentLength, req.ContentLength,
 				"the length is computed by the constructor, before serialization, whatever the reader's concrete type")
+			require.Equal(t, tc.wantRequestBodyPresent, req.Body != nil,
+				"whether a body object exists at all is what net/http reads a zero length as: a definite 0 for a nil Body, an unknown length for a non-nil one (net/http/request.go:1552-1560)")
 
 			resp, err := ht.Do(req, UnsafeOptions{})
 			require.NoError(t, err)
@@ -364,13 +465,23 @@ func TestRequestBodyBufferedRegardlessOfReaderType(t *testing.T) {
 			require.Equal(t, tc.wantBody, got.Body,
 				"the origin must receive exactly these bytes regardless of the reader's concrete type")
 			require.Equal(t, tc.wantContentLengthHdr, got.ContentLengthHdr,
-				"the declared length on the wire is identical for a length-bearing and an opaque reader")
-			require.Equal(t, tc.wantContentLength, got.ContentLength,
-				"net/http parsed a concrete declared length, so the body was buffered rather than streamed")
-			require.Empty(t, got.TransferEncoding,
-				"the retry layer buffers every body to make it rewindable, so a length is always declared and no transfer coding is applied")
-			require.NotContains(t, got.TransferEncoding, "chunked",
-				"chunked framing must never appear: it would mean the caller's reader was streamed straight through instead of buffered")
+				"the declared length on the wire follows the buffered size alone: identical for the length-bearing and the opaque reader of the same size, and absent entirely on the chunk-delimited rows")
+			require.Equal(t, tc.wantOriginContentLength, got.ContentLength,
+				"net/http parsed exactly this framing value at the origin: the buffered length for a body of non-zero size, and -1 for the non-nil empty body whose length it treats as unknown")
+			require.Equal(t, tc.wantTransferEncoding, got.TransferEncoding,
+				"the transfer coding the origin observes must be exactly this: none for a length-delimited message, chunked only for the non-nil empty body")
+			if len(tc.wantTransferEncoding) == 0 {
+				require.Empty(t, got.TransferEncoding,
+					"the retry layer buffers every body to make it rewindable, so for a body of non-zero length a length is always declared and no transfer coding is applied")
+				require.NotContains(t, got.TransferEncoding, "chunked",
+					"chunked framing must never appear for a body of non-zero length: it would mean the caller's reader was streamed straight through instead of buffered")
+			} else {
+				// The mirror of the assertion above, stated positively so the divergent rows
+				// carry their own explicit protocol-visible expectation rather than relying
+				// on the table comparison alone.
+				require.Contains(t, got.TransferEncoding, "chunked",
+					"a non-nil body of zero length is the one input class net/http frames as chunked, because outgoingLength reports its length as unknown (see the mechanism above)")
+			}
 
 			require.Equal(t, http.StatusOK, resp.StatusCode)
 			require.Equal(t, tc.wantBody, resp.Data,
@@ -381,11 +492,16 @@ func TestRequestBodyBufferedRegardlessOfReaderType(t *testing.T) {
 
 	t.Run("control: the same opaque reader streamed without the retry layer frames as chunked", func(t *testing.T) {
 		// This control asserts net/http's fallback, not this client's behaviour, and it is
-		// here for one reason: it proves the "never chunked" assertions above distinguish
-		// two genuinely reachable states at this very server rather than restating
-		// something that could not have come out otherwise. It is hermetic - a dedicated
-		// transport aimed at the same loopback address, with its own pool closed afterwards
-		// so no global state is touched.
+		// here for one reason: it proves the length-delimited rows above distinguish two
+		// genuinely reachable states at this very server rather than restating something
+		// that could not have come out otherwise. Read it together with the two empty
+		// non-nil rows: chunked framing on its own does NOT imply the retry layer was
+		// bypassed, because the retry layer also produces chunked framing for a non-nil
+		// body of zero length. What identifies a streaming regression is chunked framing
+		// for a body of NON-ZERO length, which is precisely what this control reproduces -
+		// the SAME 13 bytes the rows above send length-delimited. It is hermetic - a
+		// dedicated transport aimed at the same loopback address, with its own pool closed
+		// afterwards so no global state is touched.
 		rec := &requestBodyRecorder{}
 		ts := newRequestBodyEchoServer(t, rec)
 		defer ts.Close()
@@ -408,9 +524,9 @@ func TestRequestBodyBufferedRegardlessOfReaderType(t *testing.T) {
 		got := rec.result(t)
 
 		require.Equal(t, []string{"chunked"}, got.TransferEncoding,
-			"an unbuffered body of unknown length is chunk-delimited, which is exactly the state the rows above must never reach")
+			"an unbuffered body of unknown length is chunk-delimited, which is exactly the state the non-zero-length rows above must never reach")
 		require.Equal(t, int64(-1), got.ContentLength,
-			"chunked framing reports an unknown length as -1, the value a streaming regression would produce")
+			"chunked framing reports an unknown length as -1, the value a streaming regression would produce for these 13 bytes")
 		require.Equal(t, "", got.ContentLengthHdr,
 			"a chunked message declares no Content-Length at all")
 		require.Equal(t, []byte(requestBodyPayload), got.Body,
@@ -530,11 +646,11 @@ func TestRequestBodyReplayedOn307(t *testing.T) {
 	require.Equal(t, int64(7), framing[1].ContentLength,
 		"the replayed hop declares the same length, so the origin is told to expect the whole payload again")
 	require.Empty(t, framing[0].TransferEncoding,
-		"the buffered body always has a known length, so the first hop is length-delimited")
+		"the buffered 7-byte body has a known, non-zero length, so the first hop is length-delimited")
 	require.Empty(t, framing[1].TransferEncoding,
 		"the replayed body is equally known in length, so the redirected hop is length-delimited too")
 	require.NotContains(t, framing[1].TransferEncoding, "chunked",
-		"a replayed body must never fall back to chunked framing")
+		"a replayed body of non-zero length must never fall back to chunked framing")
 	require.True(t, framing[1].GetBodyPresent,
 		"GetBody survives onto the redirected hop, which is what allowed net/http to rewind and resend the body")
 
