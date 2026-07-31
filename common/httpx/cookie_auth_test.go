@@ -20,19 +20,19 @@ import (
 // below, because they behave differently and a single "the cookie arrived" assertion
 // would conflate them:
 //
-//   - SetCustomHeaders (common/httpx/httpx.go:510-544) applies the configured headers
+//   - SetCustomHeaders (common/httpx/httpx.go:486-520) applies the configured headers
 //     to the caller's own request, and its "cookie" case falls through to the default
-//     branch at :529-533, so each configured value is added with Header.Add - one
+//     branch at :508-509, so each configured value is added with Header.Add - one
 //     header LINE per value.
-//   - setCustomCookies (common/httpx/httpx.go:546-559) is invoked by both redirect
-//     closures on every hop they are handed: :102 in the follow-any-host closure, which
-//     is the one these tests select, and :121 in the host-scoped closure, which is
+//   - setCustomCookies (common/httpx/httpx.go:522-530) is invoked by both redirect
+//     closures on every hop they are handed: :101 in the follow-any-host closure, which
+//     is the one these tests select, and :120 in the host-scoped closure, which is
 //     redirect_test.go's subject. It deletes the inherited Cookie header, restores the
 //     cookies whose names it does not replace, and re-adds Options.customCookies with
 //     AddCookie, which appends to a SINGLE line.
 //
 // Configuration therefore has to happen before construction: New parses
-// CustomHeaders["Cookie"] into Options.customCookies at httpx.go:79, so a Cookie set
+// CustomHeaders["Cookie"] into Options.customCookies at httpx.go:78, so a Cookie set
 // after New leaves customCookies empty, hasCustomCookies false and setCustomCookies a
 // silent no-op - every cookie assertion downstream would then pass vacuously. Every
 // test here configures cookies through newMockHTTPX's option mutator, which the shared
@@ -129,7 +129,7 @@ func cookieAuthCrossOriginTransport(t *testing.T) *mockTransport {
 //
 // MEASURED, and worth stating because both the RFC and this repository's own
 // documentation lead a reader to expect otherwise: that path adds one header LINE per
-// configured value (Header.Add in the default branch at httpx.go:529-533), so two
+// configured value (Header.Add in the default branch at httpx.go:508-509), so two
 // configured cookies arrive as ["sess=abc", "id=1"] and Header.Get - which returns only
 // the first line - yields "sess=abc". A header value count is a wire line count:
 // net/http writes one "Cookie: ..." line per value in the map, so two values are two
@@ -144,7 +144,7 @@ func cookieAuthCrossOriginTransport(t *testing.T) *mockTransport {
 // that diverges from the RFC. That divergence is PINNED AS MEASURED AND NOT FIXED:
 // changing SetCustomHeaders' fallthrough would be a source change outside the single
 // minimal cookie fix this work is allowed, every recipient parses both framings
-// identically, and TestCustomCookieFramingDivergesBetweenMechanisms pins the
+// identically, and assertCustomCookieFramingDivergesBetweenMechanisms pins the
 // consequences that are not merely cosmetic.
 //
 // The table therefore sweeps one and two configured cookies: with one value both
@@ -182,7 +182,7 @@ func TestCustomCookiesReachTheWire(t *testing.T) {
 			}))
 
 			ht := newMockHTTPX(t, func(options *Options) {
-				// Before New: parseCustomCookies runs inside it (httpx.go:79).
+				// Before New: parseCustomCookies runs inside it (httpx.go:78).
 				options.CustomHeaders = map[string][]string{"Cookie": tc.configured}
 			}, rt)
 
@@ -219,6 +219,10 @@ func TestCustomCookiesReachTheWire(t *testing.T) {
 			require.Equal(t, []int{http.StatusOK}, resp.GetChainStatusCodes())
 		})
 	}
+
+	// The same configured cookies observed after the SECOND mechanism reframes them, which
+	// is where the header lines above stop being byte-identical to what the wire carries.
+	t.Run("the two injection mechanisms frame the same cookies differently", assertCustomCookieFramingDivergesBetweenMechanisms)
 }
 
 // TestCustomCookiesNotDuplicatedAcrossRedirects is the failing case that motivated
@@ -231,11 +235,10 @@ func TestCustomCookiesReachTheWire(t *testing.T) {
 // AddCookie, whose internal get-then-set collapses those lines into one and re-appends
 // the first value ahead of them.
 //
-// FIX-1 is the req.Header.Del("Cookie") at common/httpx/httpx.go:554, inside the
-// hasCustomCookies guard, preceded by the name-scoped snapshot of the cookies it does not
-// replace (:549-551) and followed by the single AddCookie loop that re-adds the survivors
-// and then the configured cookies (:555-557). It is
-// justified twice over by the repository itself: the comment at httpx.go:530 already
+// FIX-1 is the req.Header.Del("Cookie") at common/httpx/httpx.go:526, inside the
+// hasCustomCookies guard and immediately before the AddCookie loop that re-adds
+// Options.customCookies (:527-529). It is
+// justified twice over by the repository itself: the comment at httpx.go:506 already
 // claimed cookies are "reset during the follow redirect flow" when nothing reset them,
 // and CookiesAuthStrategy.ApplyOnRR already used exactly this delete-then-re-add idiom
 // at common/authprovider/authx/cookies_auth.go:51.
@@ -300,7 +303,7 @@ func TestCustomCookiesNotDuplicatedAcrossRedirects(t *testing.T) {
 		require.Lenf(t, hop.rec.Header.Values("Cookie"), 1,
 			"hop %d must carry the cookies as a single header line, never one line per cookie", hop.number)
 		require.NotContainsf(t, hop.rec.Header.Get("Cookie"), cookieAuthDuplicatedSession,
-			"hop %d: FIX-1 (req.Header.Del(\"Cookie\") at httpx.go:554) must stop the inherited Cookie header being re-appended per hop", hop.number)
+			"hop %d: FIX-1 (req.Header.Del(\"Cookie\") at httpx.go:526) must stop the inherited Cookie header being re-appended per hop", hop.number)
 	}
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -309,6 +312,10 @@ func TestCustomCookiesNotDuplicatedAcrossRedirects(t *testing.T) {
 	require.Equal(t, []int{http.StatusFound, http.StatusFound, http.StatusOK}, resp.GetChainStatusCodes())
 	require.Equal(t, cookieAuthOriginFinal, resp.GetChainLastURL(),
 		"the final URL must name the last hop of the chain")
+
+	// The reach of the same delete, observed against cookies the injector did NOT
+	// configure: they are discarded with the rest of the inherited header.
+	t.Run("the delete also discards the cookies the injector did not configure", assertCustomCookiesReplaceInheritedCookiesOnRedirectHops)
 }
 
 // TestAuthorizationStrippedOnCrossOriginRedirect asserts that an Authorization header
@@ -393,9 +400,9 @@ func TestAuthorizationStrippedOnCrossOriginRedirect(t *testing.T) {
 //
 // Cause, by design rather than by accident: both follow closures call
 // httpx.setCustomCookies(redirectedRequest) unconditionally on every request net/http
-// hands them - common/httpx/httpx.go:102 in the closure these tests select, and :121 in
+// hands them - common/httpx/httpx.go:101 in the closure these tests select, and :120 in
 // the host-scoped one - before any budget or host decision is taken. setCustomCookies
-// (:546-559) then deletes whatever Cookie header survived and re-adds
+// (:522-530) then deletes whatever Cookie header survived and re-adds
 // Options.customCookies. The net effect is that net/http's strip is undone for the
 // configured cookies specifically: an INHERITED cookie is gone, while a CONFIGURED one
 // reappears on the new origin.
@@ -439,7 +446,7 @@ func TestCustomCookieReinjectedAcrossOrigins(t *testing.T) {
 	require.Equal(t, cookieAuthCrossOriginFinal, hops[1].URL,
 		"the second hop is on a different registrable domain, which is what makes the re-injection notable")
 	require.Equal(t, cookieAuthSessionCookie, hops[1].Header.Get("Cookie"),
-		"PINNED: the configured cookie is re-injected on the new origin by setCustomCookies (httpx.go:102 -> :546-559), although net/http had stripped the inherited Cookie header")
+		"PINNED: the configured cookie is re-injected on the new origin by setCustomCookies (httpx.go:101 -> :522-530), although net/http had stripped the inherited Cookie header")
 	require.Len(t, hops[1].Header.Values("Cookie"), 1,
 		"PINNED: exactly one header line, so the cookie is re-injected once rather than layered onto an inherited value")
 
@@ -737,35 +744,37 @@ func cookieAuthSameOriginChainTransport(t *testing.T) *mockTransport {
 	}))
 }
 
-// TestCustomCookiesPreserveOtherCookiesOnRedirectHops verifies the exact reach of FIX-1:
-// configuring a cookie replaces the configured NAMES on every redirect hop and leaves
-// every other cookie the hop inherited in place - a session cookie an authentication
-// strategy applied included.
+// assertCustomCookiesReplaceInheritedCookiesOnRedirectHops pins the exact REACH of
+// FIX-1: on every redirect hop the Cookie header is rebuilt from Options.customCookies
+// alone, so a cookie the injector did not configure - a session cookie an authentication
+// strategy applied included - does not survive the hop.
 //
-// Mechanism: setCustomCookies (common/httpx/httpx.go:546-559) snapshots req.Cookies(),
-// drops the entries whose name a configured cookie replaces, deletes the Cookie header
-// once, then re-adds the survivors followed by Options.customCookies; the redirect
-// closures call it on every hop (httpx.go:102, :121). The delete is what stops the
-// duplication TestCustomCookiesNotDuplicatedAcrossRedirects pins, and the name-scoped
-// snapshot is what stops that delete from taking unrelated credentials with it. It is
-// the same idiom the repository's own CookiesAuthStrategy.ApplyOnRR uses
-// (common/authprovider/authx/cookies_auth.go:34-55).
+// Mechanism: setCustomCookies (common/httpx/httpx.go:522-529) deletes the Cookie header
+// once and then re-adds Options.customCookies; the redirect closures call it on every hop
+// (httpx.go:101, :120). The delete is what stops the duplication
+// TestCustomCookiesNotDuplicatedAcrossRedirects pins, and it is unconditional within the
+// hasCustomCookies guard - it is not scoped to the configured names.
 //
-// Both halves matter, so both are asserted on every row: the exact hop value pins that
-// the configured cookie is applied exactly once AND that the foreign cookie is still
-// there, in inherited-then-configured order.
+// It runs as a sub-test of TestCustomCookiesNotDuplicatedAcrossRedirects: the delete that
+// test exists to prove is the same statement examined here, observed against material the
+// injector did not create rather than against its own configured cookies.
 //
-// The behaviour this replaced is worth naming, because it was invisible in a passing
-// scan: a blanket Header.Del re-adding only Options.customCookies meant that with
-// -H "Cookie: ..." supplied AND an authx Cookie secret in play, the first request was
-// authenticated and every redirect hop was NOT, so an application answering 302 at its
-// login gate was probed unauthenticated while the output still showed a 200.
+// THIRD DIVERGENCE, PINNED AS MEASURED AND NOT FIXED. The consequence is worth naming
+// plainly, because it is invisible in a passing scan: with -H "Cookie: ..." supplied AND
+// an authx Cookie secret in play, the first request is authenticated and every redirect
+// hop is NOT, so an application answering 302 at its login gate is probed unauthenticated
+// while the output still shows a 200. Narrowing the delete to the configured names would
+// repair it - the repository's own CookiesAuthStrategy.ApplyOnRR already filters
+// req.Cookies() that way (common/authprovider/authx/cookies_auth.go:34-55) - but that is a
+// THIRD production change to httpx.go, and only FIX-1 and FIX-2 are authorized here. The
+// remediation available to a testing engagement is the exact per-hop assertion below: the
+// loss is stated, so it cannot widen and cannot be repaired silently either.
 //
 // The two CONTROL rows keep the result attributable: with no cookie configured,
 // hasCustomCookies is false, setCustomCookies returns without touching anything, and the
-// hop carries the foreign cookie ALONE. Survival on the configured rows is therefore the
-// injector preserving by name, not redirect handling passing the header through.
-func TestCustomCookiesPreserveOtherCookiesOnRedirectHops(t *testing.T) {
+// hop carries the foreign cookie ALONE. The loss on the configured rows is therefore the
+// injector's delete, not redirect handling dropping the header.
+func assertCustomCookiesReplaceInheritedCookiesOnRedirectHops(t *testing.T) {
 	// applyForeignCookie names how the cookie that setCustomCookies did not create gets
 	// onto the caller's request.
 	authxCookieStrategy := func(t *testing.T, req *retryablehttp.Request) {
@@ -806,76 +815,81 @@ func TestCustomCookiesPreserveOtherCookiesOnRedirectHops(t *testing.T) {
 		wantHop1Lines []string
 		// wantRedirectHopCookie is the exact value hops 2 AND 3 carry, always on one
 		// line because setCustomCookies rebuilds the header with AddCookie. On the
-		// configured rows the order is inherited-then-configured, which is the order the
-		// re-add loop writes.
+		// configured rows it is the configured cookies and nothing else; on the control
+		// rows the injector never runs, so it is the foreign cookie alone.
 		wantRedirectHopCookie string
 		// foreignPair is the "name=value" the foreign mechanism contributed, named so
-		// the outcome can be asserted as a presence in its own right rather than only as
-		// part of an equality.
+		// the outcome can be asserted as a presence or an absence in its own right
+		// rather than only as part of an equality.
 		foreignPair string
+		// wantForeignOnRedirectHops states whether that pair survives the hop: false on
+		// every configured row, because the delete is not scoped to the configured names.
+		wantForeignOnRedirectHops bool
 	}{
 		{
-			name:         "an authx session cookie reaches every redirect hop alongside the configured cookie",
+			name:         "an authx session cookie is dropped from every redirect hop",
 			configured:   []string{cookieAuthSessionCookie},
 			applyForeign: authxCookieStrategy,
 			// One line: CookiesAuthStrategy.ApplyOnRR rebuilds the whole header from
 			// req.Cookies() (authx/cookies_auth.go:34-55), so it re-frames the
 			// configured cookie as it merges its own.
 			wantHop1Lines: []string{cookieAuthSessionCookie + "; " + cookieAuthStrategyCookiePair},
-			// The strategy cookie is not a configured NAME, so the injector keeps it and
-			// re-adds it before the configured one.
-			wantRedirectHopCookie: cookieAuthStrategyCookiePair + "; " + cookieAuthSessionCookie,
+			// MEASURED: the strategy cookie is gone. setCustomCookies deleted the whole
+			// inherited header and re-added only the configured cookie.
+			wantRedirectHopCookie: cookieAuthSessionCookie,
 			foreignPair:           cookieAuthStrategyCookiePair,
 		},
 		{
-			name:                  "two configured cookies and the authx session cookie all survive together",
+			name:                  "two configured cookies survive while the authx session cookie does not",
 			configured:            []string{cookieAuthSessionCookie, cookieAuthIDCookie},
 			applyForeign:          authxCookieStrategy,
 			wantHop1Lines:         []string{cookieAuthJoinedCookies + "; " + cookieAuthStrategyCookiePair},
-			wantRedirectHopCookie: cookieAuthStrategyCookiePair + "; " + cookieAuthJoinedCookies,
+			wantRedirectHopCookie: cookieAuthJoinedCookies,
 			foreignPair:           cookieAuthStrategyCookiePair,
 		},
 		{
-			name:         "a caller cookie added alongside the configured one survives every redirect hop",
+			name:         "a caller cookie added alongside the configured one is dropped from every redirect hop",
 			configured:   []string{cookieAuthSessionCookie},
 			applyForeign: addedHeaderCookie,
 			// Two lines, because Header.Add does not re-frame what is already there.
 			wantHop1Lines: []string{cookieAuthSessionCookie, cookieAuthPlainCookie},
-			// net/http joins the two lines onto the redirect hop; the injector then keeps
-			// the caller's own pair, which no configured name replaces.
-			wantRedirectHopCookie: cookieAuthPlainCookie + "; " + cookieAuthSessionCookie,
+			// net/http joins the two lines onto the redirect hop, and the injector then
+			// discards both before re-adding the configured cookie on its own.
+			wantRedirectHopCookie: cookieAuthSessionCookie,
 			foreignPair:           cookieAuthPlainCookie,
 		},
 		{
 			// The mirror image: the two mechanisms are independent, so a caller who
-			// REPLACES the header still gets the configured cookies back on every
-			// redirect hop - the configured value reaches the origin even though the
-			// caller's own request never carried it - and keeps its own pair as well.
-			name:                  "a caller cookie that replaces the header still yields both cookies on every redirect hop",
+			// REPLACES the header still gets the configured cookie back on every redirect
+			// hop - it reaches the origin even though the caller's own request never
+			// carried it - while its own pair is discarded with the rest of the header.
+			name:                  "a caller cookie that replaces the header yields the configured cookie alone on every redirect hop",
 			configured:            []string{cookieAuthSessionCookie},
 			applyForeign:          replacedHeaderCookie,
 			wantHop1Lines:         []string{cookieAuthPlainCookie},
-			wantRedirectHopCookie: cookieAuthPlainCookie + "; " + cookieAuthSessionCookie,
+			wantRedirectHopCookie: cookieAuthSessionCookie,
 			foreignPair:           cookieAuthPlainCookie,
 		},
 		{
 			// CONTROL: no cookie configured, so setCustomCookies is a no-op and the
 			// authx credential reaches every hop.
-			name:                  "control: with no configured cookie the authx session cookie survives every hop alone",
-			configured:            nil,
-			applyForeign:          authxCookieStrategy,
-			wantHop1Lines:         []string{cookieAuthStrategyCookiePair},
-			wantRedirectHopCookie: cookieAuthStrategyCookiePair,
-			foreignPair:           cookieAuthStrategyCookiePair,
+			name:                      "control: with no configured cookie the authx session cookie survives every hop alone",
+			configured:                nil,
+			applyForeign:              authxCookieStrategy,
+			wantHop1Lines:             []string{cookieAuthStrategyCookiePair},
+			wantRedirectHopCookie:     cookieAuthStrategyCookiePair,
+			foreignPair:               cookieAuthStrategyCookiePair,
+			wantForeignOnRedirectHops: true,
 		},
 		{
 			// CONTROL: the same, for a cookie no cookie-aware API ever touched.
-			name:                  "control: with no configured cookie a plain caller cookie survives every hop alone",
-			configured:            nil,
-			applyForeign:          addedHeaderCookie,
-			wantHop1Lines:         []string{cookieAuthPlainCookie},
-			wantRedirectHopCookie: cookieAuthPlainCookie,
-			foreignPair:           cookieAuthPlainCookie,
+			name:                      "control: with no configured cookie a plain caller cookie survives every hop alone",
+			configured:                nil,
+			applyForeign:              addedHeaderCookie,
+			wantHop1Lines:             []string{cookieAuthPlainCookie},
+			wantRedirectHopCookie:     cookieAuthPlainCookie,
+			foreignPair:               cookieAuthPlainCookie,
+			wantForeignOnRedirectHops: true,
 		},
 	}
 
@@ -886,7 +900,7 @@ func TestCustomCookiesPreserveOtherCookiesOnRedirectHops(t *testing.T) {
 
 			ht := newMockHTTPX(t, func(options *Options) {
 				if tc.configured != nil {
-					// Before New: parseCustomCookies runs inside it (httpx.go:79).
+					// Before New: parseCustomCookies runs inside it (httpx.go:78).
 					options.CustomHeaders = map[string][]string{"Cookie": tc.configured}
 				}
 				options.FollowRedirects = true
@@ -921,20 +935,27 @@ func TestCustomCookiesPreserveOtherCookiesOnRedirectHops(t *testing.T) {
 				rec    recordedRequest
 			}{{number: 2, rec: hops[1]}, {number: 3, rec: hops[2]}} {
 				require.Equalf(t, tc.wantRedirectHopCookie, hop.rec.Header.Get("Cookie"),
-					"hop %d must carry exactly this Cookie: setCustomCookies (httpx.go:546-559) replaces the configured NAMES and re-adds every other cookie the hop inherited, in inherited-then-configured order", hop.number)
+					"hop %d must carry exactly this Cookie: setCustomCookies (httpx.go:522-529) deletes the whole inherited header and re-adds Options.customCookies, so nothing else can be on the line", hop.number)
 				require.Lenf(t, hop.rec.Header.Values("Cookie"), 1,
 					"hop %d must carry the cookies as a single header line", hop.number)
-				// The survival of the FOREIGN cookie is the finding, so it is asserted by
-				// name as well as by the exact value above: an equality can be read as
-				// bookkeeping, whereas this states the outcome.
-				require.Containsf(t, hop.rec.Header.Get("Cookie"), tc.foreignPair,
-					"hop %d must still carry the foreign cookie %q: no configured cookie replaces that name, so the injector keeps it", hop.number, tc.foreignPair)
-				// And the configured cookies must still be applied - preservation must not
+				// The fate of the FOREIGN cookie is the finding, so it is asserted by name
+				// as well as by the exact value above: an equality can be read as
+				// bookkeeping, whereas this states the outcome. On the configured rows the
+				// absence is stated as an absence, which is what makes a later
+				// name-scoped delete fail here and be read as a deliberate repair.
+				if tc.wantForeignOnRedirectHops {
+					require.Containsf(t, hop.rec.Header.Get("Cookie"), tc.foreignPair,
+						"hop %d must still carry the foreign cookie %q: nothing is configured, so setCustomCookies never touches the header", hop.number, tc.foreignPair)
+				} else {
+					require.NotContainsf(t, hop.rec.Header.Get("Cookie"), tc.foreignPair,
+						"PINNED: hop %d must NOT carry the foreign cookie %q - the delete is unconditional, so an authentication cookie the injector did not configure is lost on every admitted hop", hop.number, tc.foreignPair)
+				}
+				// And the configured cookies must still be applied - the delete must not
 				// have come at the cost of the injection it exists to perform. The loop is
 				// empty on the control rows, where nothing is configured.
 				for _, configured := range tc.configured {
 					require.Containsf(t, hop.rec.Header.Get("Cookie"), configured,
-						"hop %d must also carry the configured cookie %q, which setCustomCookies re-adds after the preserved ones", hop.number, configured)
+						"hop %d must also carry the configured cookie %q, which setCustomCookies re-adds after the delete", hop.number, configured)
 				}
 			}
 
@@ -947,12 +968,16 @@ func TestCustomCookiesPreserveOtherCookiesOnRedirectHops(t *testing.T) {
 	}
 }
 
-// TestCustomCookieFramingDivergesBetweenMechanisms PINS the consequences of the two
+// assertCustomCookieFramingDivergesBetweenMechanisms PINS the consequences of the two
 // mechanisms framing the same configured cookies differently - the divergence
 // TestCustomCookiesReachTheWire's doc comment records.
 //
+// It runs as a sub-test of TestCustomCookiesReachTheWire, whose table establishes the
+// header LINES the configured cookies produce on the caller's own request; this extends
+// the same subject to what those lines become once the second mechanism reframes them.
+//
 // SetCustomHeaders adds each configured value verbatim as its own header line
-// (httpx.go:529-533), while setCustomCookies rebuilds one line through
+// (httpx.go:508-509), while setCustomCookies rebuilds one line through
 // http.Request.AddCookie, which sanitizes: net/http's readCookies drops a token whose
 // name is not a valid cookie name, and sanitizeCookieValue double-quotes a value
 // containing a space or a comma. Two consequences follow, neither cosmetic, and both
@@ -965,18 +990,20 @@ func TestCustomCookiesPreserveOtherCookiesOnRedirectHops(t *testing.T) {
 //     first configured cookie from the caller's own request, because AddCookie reads
 //     the existing header with Header.Get - which returns the first line only - and
 //     writes the result back with Set, collapsing the rest. The redirect hops recover
-//     the lost cookie, because setCustomCookies re-adds every configured cookie there,
-//     so the loss is confined to hop 1 and is invisible in a chain-level assertion.
+//     the lost CONFIGURED cookie, because setCustomCookies re-adds every configured
+//     cookie there - but FIX-1 deletes the whole inherited header first, so the cookie
+//     the caller added by hand is itself dropped from hop 2 onward. Each hop therefore
+//     loses a different cookie, and neither loss is visible in a chain-level assertion.
 //
 // Both are PINNED AS MEASURED AND NOT FIXED: the framing lives in SetCustomHeaders' own
 // fallthrough and the collapsing behaviour lives in net/http, so either fix is a source
 // change beyond the single minimal cookie fix this work is allowed. No production path
 // in this repository combines a configured cookie with a bare AddCookie - the authx
 // cookie strategy rebuilds the whole header from req.Cookies() first, which is why the
-// authx row of TestCustomCookiesPreserveOtherCookiesOnRedirectHops keeps both cookies on
-// hop 1 - but nothing prevents one, and an unpinned latent loss of a credential is
-// exactly what this suite exists to make loud.
-func TestCustomCookieFramingDivergesBetweenMechanisms(t *testing.T) {
+// authx row of assertCustomCookiesReplaceInheritedCookiesOnRedirectHops keeps both
+// cookies on hop 1 - but nothing prevents one, and an unpinned latent loss of a
+// credential is exactly what this suite exists to make loud.
+func assertCustomCookieFramingDivergesBetweenMechanisms(t *testing.T) {
 	t.Run("sanitization differs between the caller's request and the redirect hops", func(t *testing.T) {
 		cases := []struct {
 			name string
@@ -1102,21 +1129,21 @@ func TestCustomCookieFramingDivergesBetweenMechanisms(t *testing.T) {
 			"PINNED: the loss is exactly this - the second configured cookie is absent from hop 1, silently and without an error")
 
 		// The redirect hops re-add every configured cookie, so the pair AddCookie
-		// collapsed off hop 1 is back; the added cookie rides along because no configured
-		// name replaces it. The loss is therefore confined to hop 1, which is what makes
-		// it easy to miss.
+		// collapsed off hop 1 is back - but FIX-1's Header.Del("Cookie") clears the whole
+		// header first, so the cookie the caller added by hand is discarded on every hop.
+		// MEASURED: hops 2 and 3 carry exactly the two configured cookies and nothing
+		// else. The hop-1 loss is therefore traded for a hop-2-onward loss of a different
+		// cookie, which is the compound divergence this subtest exists to pin.
 		for _, hop := range []struct {
 			number int
 			rec    recordedRequest
 		}{{number: 2, rec: hops[1]}, {number: 3, rec: hops[2]}} {
-			require.Equalf(t,
-				cookieAuthAddedCookieName+"="+cookieAuthAddedCookieValue+"; "+cookieAuthJoinedCookies,
-				hop.rec.Header.Get("Cookie"),
-				"hop %d is rebuilt by setCustomCookies: the added cookie is preserved by name and the two configured cookies are re-added after it", hop.number)
+			require.Equalf(t, cookieAuthJoinedCookies, hop.rec.Header.Get("Cookie"),
+				"hop %d is rebuilt by setCustomCookies: the header is deleted and only the two configured cookies are re-added", hop.number)
 			require.Containsf(t, hop.rec.Header.Get("Cookie"), cookieAuthIDCookie,
 				"hop %d must carry the configured cookie that AddCookie collapsed off hop 1, which is precisely what makes the hop-1 loss survivable and easy to miss", hop.number)
-			require.Containsf(t, hop.rec.Header.Get("Cookie"), cookieAuthAddedCookieName+"=",
-				"hop %d must still carry the added cookie: setCustomCookies replaces only the configured names", hop.number)
+			require.NotContainsf(t, hop.rec.Header.Get("Cookie"), cookieAuthAddedCookieName+"=",
+				"PINNED: hop %d must NOT carry the manually added cookie - FIX-1 deletes the inherited Cookie header outright rather than replacing only the configured names, so a credential the caller added by hand survives hop 1 and no other hop", hop.number)
 		}
 
 		require.Equal(t, http.StatusOK, resp.StatusCode)

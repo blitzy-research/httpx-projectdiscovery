@@ -18,8 +18,8 @@ import (
 // Connection policy and the per-request connection lifecycle.
 //
 // New configures its HTTP/1.1 transport with DisableKeepAlives: true and
-// MaxIdleConnsPerHost: -1 (the transport literal at common/httpx/httpx.go:145-154, those
-// two fields at :153 and :148). That is a deliberate, scanner-specific choice rather than
+// MaxIdleConnsPerHost: -1 (the transport literal at common/httpx/httpx.go:144-153, those
+// two fields at :152 and :147). That is a deliberate, scanner-specific choice rather than
 // an accident of defaults - net/http's own default is to reuse connections. Every probe
 // therefore gets its own connection, so a target cannot correlate probes across one
 // socket, per-connection server state cannot leak from one probe into the next, and
@@ -56,7 +56,7 @@ import (
 // one family opens a hole.
 //
 // No test here opts into parallel execution. No test in the package does - New sets the
-// process-global GODEBUG variable on its HTTP/1.1 path (httpx.go:158), which is unsafe to
+// process-global GODEBUG variable on its HTTP/1.1 path (httpx.go:157), which is unsafe to
 // race - and these tests additionally count connections against a shared loopback
 // listener, which running them in parallel would make meaningless. For the same reason
 // every request is issued SEQUENTIALLY: concurrent requests need separate connections even
@@ -181,14 +181,14 @@ func newConnectionObserverServer(t *testing.T, rec *connectionRecorder, body str
 // production configuration.
 //
 // MEASURED against the code as it stands, and confirmed field by field against the
-// transport literal at common/httpx/httpx.go:145-154:
+// transport literal at common/httpx/httpx.go:144-153:
 //
-//	DisableKeepAlives   true   (:153)
-//	MaxIdleConnsPerHost -1     (:148)
+//	DisableKeepAlives   true   (:152)
+//	MaxIdleConnsPerHost -1     (:147)
 //	MaxIdleConns        0      - never set by the literal, so the zero value
 //	ForceAttemptHTTP2   false  - never set by the literal, so the zero value
-//	TLSClientConfig     InsecureSkipVerify true (:150), MinVersion TLS 1.0 (:151)
-//	TLSNextProto        nil    - only the HTTP/1.1-forced branch at :159 assigns it
+//	TLSClientConfig     InsecureSkipVerify true (:149), MinVersion TLS 1.0 (:150)
+//	TLSNextProto        nil    - only the HTTP/1.1-forced branch at :158 assigns it
 func TestTransportDisablesConnectionReuse(t *testing.T) {
 	ht := newLocalHTTPX(t)
 	// newLocalHTTPX does not release the disk-backed fastdialer history New allocates, so
@@ -203,9 +203,9 @@ func TestTransportDisablesConnectionReuse(t *testing.T) {
 
 	// The two fields that decide connection reuse.
 	require.True(t, tr.DisableKeepAlives,
-		"keep-alives must stay disabled (httpx.go:153): with reuse enabled several probes share one connection, so a target can correlate them, per-connection server state leaks from one probe into the next, and per-connection rate limiting sees one connection instead of one per request")
+		"keep-alives must stay disabled (httpx.go:152): with reuse enabled several probes share one connection, so a target can correlate them, per-connection server state leaks from one probe into the next, and per-connection rate limiting sees one connection instead of one per request")
 	require.Equal(t, -1, tr.MaxIdleConnsPerHost,
-		"MaxIdleConnsPerHost must stay -1 (httpx.go:148): a negative limit stops net/http caching an idle connection at all, which is the second and independent guard against reuse - MEASURED, it is what keeps peer addresses distinct even when DisableKeepAlives is flipped, so this field read is the only assertion in the suite that catches a change to it")
+		"MaxIdleConnsPerHost must stay -1 (httpx.go:147): a negative limit stops net/http caching an idle connection at all, which is the second and independent guard against reuse - MEASURED, it is what keeps peer addresses distinct even when DisableKeepAlives is flipped, so this field read is the only assertion in the suite that catches a change to it")
 
 	// Two fields the literal deliberately leaves at their zero value.
 	require.Equal(t, 0, tr.MaxIdleConns,
@@ -214,15 +214,19 @@ func TestTransportDisablesConnectionReuse(t *testing.T) {
 		"ForceAttemptHTTP2 must keep its zero value - it never appears in the transport literal: because that literal sets a custom DialTLSContext and TLSClientConfig, net/http will not negotiate HTTP/2 over TLS unless this field is true, so its zero value is what keeps this client on HTTP/1.1 while the separate HTTP/2 client handles h2")
 
 	// The TLS posture the same literal establishes.
-	require.NotNil(t, tr.TLSClientConfig, "the transport literal sets a TLS config (httpx.go:149-152)")
+	require.NotNil(t, tr.TLSClientConfig, "the transport literal sets a TLS config (httpx.go:148-151)")
 	require.True(t, tr.TLSClientConfig.InsecureSkipVerify,
-		"certificate verification must stay disabled (httpx.go:150): probing hosts that serve expired, self-signed or mismatched certificates is the point of the tool, and verifying would turn those targets into errors instead of results")
+		"certificate verification must stay disabled (httpx.go:149): probing hosts that serve expired, self-signed or mismatched certificates is the point of the tool, and verifying would turn those targets into errors instead of results")
 	require.Equal(t, uint16(tls.VersionTLS10), tr.TLSClientConfig.MinVersion,
-		"the negotiated floor must stay TLS 1.0 (httpx.go:151) so legacy endpoints remain reachable; raising it would silently drop those targets rather than report them")
+		"the negotiated floor must stay TLS 1.0 (httpx.go:150) so legacy endpoints remain reachable; raising it would silently drop those targets rather than report them")
 
 	// Proof that this client was built on the default protocol path.
 	require.Nil(t, tr.TLSNextProto,
-		"TLSNextProto must be nil on the default protocol path: only the HTTP/1.1-forced branch assigns it (httpx.go:159), and that branch also mutates the process-global GODEBUG variable (httpx.go:158) - a non-nil value here would mean this test observed a client built on that branch instead of the default one")
+		"TLSNextProto must be nil on the default protocol path: only the HTTP/1.1-forced branch assigns it (httpx.go:157), and that branch also mutates the process-global GODEBUG variable (httpx.go:158) - a non-nil value here would mean this test observed a client built on that branch instead of the default one")
+
+	// The same per-field reads applied to the two clients New builds BESIDE the primary,
+	// where every one of them must come back empty.
+	t.Run("the secondary clients carry none of the primary's request policy", assertSecondaryClientsDoNotCarryThePrimaryRequestPolicy)
 }
 
 // TestConnectionNotReusedAcrossRequests pins the observable consequence of that
@@ -311,8 +315,8 @@ func TestConnectionNotReusedAcrossRequests(t *testing.T) {
 //
 // This is the direct realization of the "state of a connection after close" assertion the
 // requirements name. Do wraps the body in a limiting reader and registers a deferred
-// io.Copy(io.Discard, ...) plus Close (common/httpx/httpx.go:302-310), and closes the body
-// explicitly at :348, so by the time Do returns the connection has already been drained
+// io.Copy(io.Discard, ...) plus Close (common/httpx/httpx.go:286-291), and closes the body
+// explicitly at :324, so by the time Do returns the connection has already been drained
 // and released and the caller closes nothing - *Response exposes no Close method at all.
 // What the caller is left with therefore has to be self-contained, and this test proves it
 // is by fetching a SECOND response and only then asserting on the first.
@@ -343,7 +347,7 @@ func TestConnectionStateAfterClose(t *testing.T) {
 	// whole point: the first response must still own its fully drained body once its
 	// connection has been closed and a second exchange has come and gone.
 	require.Equal(t, []byte(connectionStateBody), respA.Data,
-		"the first response must still hold its complete body after its connection was closed and a second request was served: Do drains and closes the body before returning (httpx.go:302-310, :348), so the bytes the caller keeps cannot depend on the connection still being open")
+		"the first response must still hold its complete body after its connection was closed and a second request was served: Do drains and closes the body before returning (httpx.go:286-291, :324), so the bytes the caller keeps cannot depend on the connection still being open")
 	require.Equal(t, len(connectionStateBody), respA.ContentLength,
 		"the first response must report the exact number of bytes delivered")
 	require.Equal(t, http.StatusOK, respA.StatusCode, "the first exchange completed with 200")
@@ -389,13 +393,13 @@ func TestConnectionStateAfterClose(t *testing.T) {
 //	client.HTTPClient2            retryablehttp NewClient      retryablehttp do.go, when an
 //	                              (a library DefaultClient,    HTTP/1.1 round trip fails with
 //	                              never touched by httpx.go)   a malformed-HTTP-version error
-//	client2 (*http.Client with    common/httpx/httpx.go:192-205 SupportHTTP2, common/httpx/
+//	client2 (*http.Client with    common/httpx/httpx.go:191-204 SupportHTTP2, common/httpx/
 //	an *http2.Transport)                                       http2.go:55 (the -http2 probe)
 //
 // The primary's policy is assembled in New: redirectFunc (httpx.go:92-143, which is also
 // what re-applies the configured cookies on every admitted hop), the fastdialer built from
-// fastdialerOpts.NetworkPolicy (:61-74, the -deny/-exclude guard), and the proxy resolved
-// from -http-proxy/-socks-proxy (:166-181). All three are installed on the primary's
+// fastdialerOpts.NetworkPolicy (:60-74, the -deny/-exclude guard), and the proxy resolved
+// from -http-proxy/-socks-proxy (:165-179). All three are installed on the primary's
 // http.Client and http.Transport ONLY. The two secondary clients are constructed
 // separately - one by the dependency, one by the transport2 literal - and receive none of
 // them.
@@ -579,8 +583,13 @@ func doSecondaryExpectingError(t *testing.T, client *http.Client, target string)
 	return doErr
 }
 
-// TestSecondaryClientsDoNotCarryThePrimaryRequestPolicy pins, per policy and per client,
+// assertSecondaryClientsDoNotCarryThePrimaryRequestPolicy pins, per policy and per client,
 // which of New's three clients a configured request policy actually reaches.
+//
+// It runs as a sub-test of TestTransportDisablesConnectionReuse, which establishes what
+// New configures on the PRIMARY transport; this extends the same subject to the two
+// secondary clients New also builds, where the same white-box reads show the policy is
+// absent rather than present.
 //
 // Each sub-test states the same thing twice: once as a white-box read of the constructed
 // client, which names the field a one-line edit would change, and once as an outcome an
@@ -591,7 +600,7 @@ func doSecondaryExpectingError(t *testing.T, client *http.Client, target string)
 //
 // The full mechanism, the security consequence and the reason the asymmetry is pinned
 // rather than repaired are in the section comment above.
-func TestSecondaryClientsDoNotCarryThePrimaryRequestPolicy(t *testing.T) {
+func assertSecondaryClientsDoNotCarryThePrimaryRequestPolicy(t *testing.T) {
 	t.Run("the fallback client is a distinct client carrying no redirect policy", func(t *testing.T) {
 		ht := newSecondaryPolicyHTTPX(t, nil)
 
@@ -604,11 +613,11 @@ func TestSecondaryClientsDoNotCarryThePrimaryRequestPolicy(t *testing.T) {
 
 		// The primary carries the closure New built; the fallback carries nothing.
 		require.NotNil(t, ht.client.HTTPClient.CheckRedirect,
-			"the primary client must carry the redirect closure New assembled (httpx.go:92-143, installed at :182-186): without it the primary comparison below would prove nothing")
+			"the primary client must carry the redirect closure New assembled (httpx.go:92-143, installed at :181-185): without it the primary comparison below would prove nothing")
 		require.Nil(t, ht.client.HTTPClient2.CheckRedirect,
 			"the fallback client must be observed carrying NO redirect policy: retryablehttp builds it as a library DefaultClient and httpx.go never assigns CheckRedirect on it, so net/http's own default - follow up to 10 hops, to any host, without running setCustomCookies - is what applies on the fallback path")
 		require.NotSame(t, ht.client.HTTPClient, ht.client.HTTPClient2,
-			"on the default protocol path the two must be different clients: they are aliased only when -http11 is forced (httpx.go:188-190), and aliasing here would silently give the fallback the primary's policy and make this whole section vacuous")
+			"on the default protocol path the two must be different clients: they are aliased only when -http11 is forced (httpx.go:187-189), and aliasing here would silently give the fallback the primary's policy and make this whole section vacuous")
 
 		// The one policy that IS symmetric. Asserting it alongside the asymmetric ones is
 		// what shows the fallback is a CONFIGURED client missing specific policy, not an
@@ -656,7 +665,7 @@ func TestSecondaryClientsDoNotCarryThePrimaryRequestPolicy(t *testing.T) {
 		})
 
 		require.Equal(t, secondaryUnusableProxy, ht.Options.Proxy,
-			"New must have resolved -http-proxy into Options.Proxy (httpx.go:166-181): if it had not, the primary failure below would have some other cause")
+			"New must have resolved -http-proxy into Options.Proxy (httpx.go:165-179): if it had not, the primary failure below would have some other cause")
 
 		srv := newSecondaryHTTP2Server(t)
 		defer srv.Close()
@@ -718,7 +727,7 @@ func TestSecondaryClientsDoNotCarryThePrimaryRequestPolicy(t *testing.T) {
 			options.NetworkPolicy = policy
 		})
 		require.NotNil(t, ht.NetworkPolicy,
-			"New must have retained the policy on the client (httpx.go:61-63); it threads the same value into the fastdialer, which is the only place it is enforced")
+			"New must have retained the policy on the client (httpx.go:60-63); it threads the same value into the fastdialer, which is the only place it is enforced")
 
 		srv := newSecondaryHTTP2Server(t)
 		defer srv.Close()
@@ -755,9 +764,9 @@ func TestSecondaryClientsDoNotCarryThePrimaryRequestPolicy(t *testing.T) {
 	t.Run("the native HTTP/2 client's transport is built without a policy hook", func(t *testing.T) {
 		ht := newSecondaryPolicyHTTPX(t, nil)
 
-		require.NotNil(t, ht.client2, "New must build the native HTTP/2 client (httpx.go:202-205)")
+		require.NotNil(t, ht.client2, "New must build the native HTTP/2 client (httpx.go:201-204)")
 		require.Nil(t, ht.client2.CheckRedirect,
-			"the native HTTP/2 client must be observed carrying no redirect policy: the literal at httpx.go:202-205 sets only Transport and Timeout")
+			"the native HTTP/2 client must be observed carrying no redirect policy: the literal at httpx.go:201-204 sets only Transport and Timeout")
 		require.Nil(t, ht.client2.Jar,
 			"the native HTTP/2 client must carry no cookie jar, so nothing restores per-host cookie state that setCustomCookies would have applied on the primary path")
 		require.Equal(t, ht.Options.Timeout, ht.client2.Timeout,
@@ -765,10 +774,10 @@ func TestSecondaryClientsDoNotCarryThePrimaryRequestPolicy(t *testing.T) {
 
 		transport, ok := ht.client2.Transport.(*http2.Transport)
 		require.True(t, ok,
-			"the native HTTP/2 client must carry the *http2.Transport the literal at httpx.go:192-200 built (found %T): every field below lives on that concrete type", ht.client2.Transport)
+			"the native HTTP/2 client must carry the *http2.Transport the literal at httpx.go:191-200 built (found %T): every field below lives on that concrete type", ht.client2.Transport)
 
 		require.True(t, transport.AllowHTTP,
-			"AllowHTTP must stay true (httpx.go:198): it is what lets the h2c probe address a cleartext origin at all")
+			"AllowHTTP must stay true (httpx.go:196): it is what lets the h2c probe address a cleartext origin at all")
 		require.Nil(t, transport.DialTLSContext,
 			"DialTLSContext must stay nil: this is the field that would have to hold httpx.Dialer for the network policy and the resolver cache to apply, and its being unset is exactly why the denied address is reachable above")
 		// Reading the DEPRECATED seam is deliberate and the staticcheck exemption is part of
@@ -782,16 +791,16 @@ func TestSecondaryClientsDoNotCarryThePrimaryRequestPolicy(t *testing.T) {
 			"ConnPool must keep its zero value: the literal sets no pool, so a value here would mean the transport literal had been rewritten")
 
 		// The same TLS posture the primary transport carries, asserted here because it is
-		// established by a SECOND literal (httpx.go:192-197) that no other test reads. The
+		// established by a SECOND literal (httpx.go:191-197) that no other test reads. The
 		// posture itself is deliberate - see TestTransportDisablesConnectionReuse - but a
 		// change to one literal and not the other would leave the two clients disagreeing
 		// about how much of a certificate to trust, and nothing else would notice.
-		require.NotNil(t, transport.TLSClientConfig, "the http2 transport literal sets a TLS config (httpx.go:193-196)")
+		require.NotNil(t, transport.TLSClientConfig, "the http2 transport literal sets a TLS config (httpx.go:192-195)")
 		require.True(t, transport.TLSClientConfig.InsecureSkipVerify,
-			"certificate verification must stay disabled on the HTTP/2 client too (httpx.go:194), matching the primary transport: probing hosts that serve expired, self-signed or mismatched certificates is the point of the tool")
+			"certificate verification must stay disabled on the HTTP/2 client too (httpx.go:193), matching the primary transport: probing hosts that serve expired, self-signed or mismatched certificates is the point of the tool")
 		require.Equal(t, uint16(tls.VersionTLS10), transport.TLSClientConfig.MinVersion,
-			"the HTTP/2 client's negotiated floor must stay TLS 1.0 (httpx.go:195), matching the primary transport, so legacy endpoints stay reachable on both paths")
+			"the HTTP/2 client's negotiated floor must stay TLS 1.0 (httpx.go:194), matching the primary transport, so legacy endpoints stay reachable on both paths")
 		require.Equal(t, "", transport.TLSClientConfig.ServerName,
-			"ServerName must stay empty unless -sni is given: only the SniName branch assigns it (httpx.go:199-201), so a value here would mean this client was built on that branch instead of the default one")
+			"ServerName must stay empty unless -sni is given: only the SniName branch assigns it (httpx.go:198-200), so a value here would mean this client was built on that branch instead of the default one")
 	})
 }

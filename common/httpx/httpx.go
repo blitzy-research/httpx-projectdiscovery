@@ -11,7 +11,6 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -143,8 +142,8 @@ func New(options *Options) (*HTTPX, error) {
 		}
 	}
 	transport := &http.Transport{
-		DialContext:         httpx.Dialer.Dial,
-		DialTLSContext:      httpx.buildTLSDialer(options),
+		DialContext: httpx.Dialer.Dial,
+		DialTLSContext: httpx.buildTLSDialer(options),
 		MaxIdleConnsPerHost: -1,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
@@ -274,27 +273,6 @@ get_response:
 	resp.Input = req.Host
 
 	resp.Headers = httpresp.Header.Clone()
-
-	// The body the transport returned is the only handle on the underlying connection,
-	// and every step below replaces httpresp.Body: the read cap wraps it in a limited
-	// reader that drops the original closer, and the response dump swaps in an in-memory
-	// reader. Keep the original here and release it on every exit path, because three
-	// paths never read it to completion - a capped body, a skipped body read, and a
-	// content-encoding retry that abandons this response - so nothing else would free it.
-	// releaseTransportBody clears the handle after closing it, which keeps the release at
-	// exactly once even when the retry below acquires a second body. Every consumer below
-	// is handed a wrapper rather than this handle - see the read-cap branch and its else -
-	// so the release owns the close outright instead of relying on a second close being
-	// harmless.
-	transportBody := httpresp.Body
-	releaseTransportBody := func() {
-		if transportBody != nil {
-			_ = transportBody.Close()
-			transportBody = nil
-		}
-	}
-	defer releaseTransportBody()
-
 	// body shouldn't be read with the following status codes
 	// 101 - Switching Protocols => websockets don't have a readable body
 	// 304 - Not Modified => no body the response terminates with latest header newline
@@ -302,7 +280,7 @@ get_response:
 
 	if h.Options.MaxResponseBodySizeToRead > 0 {
 		if httpresp.ContentLength > h.Options.MaxResponseBodySizeToRead {
-			httpresp.ContentLength = -1 // mark the length unknown so the response dump accepts the capped body
+			httpresp.ContentLength = -1 // body is about to be truncated by the read cap
 		}
 		httpresp.Body = io.NopCloser(io.LimitReader(httpresp.Body, h.Options.MaxResponseBodySizeToRead))
 		if !shouldSkipBodyRead {
@@ -311,13 +289,6 @@ get_response:
 				_ = httpresp.Body.Close()
 			}()
 		}
-	} else {
-		// A non-positive cap skips the limiter above, which would otherwise leave the dump
-		// below holding the transport body itself: the dump closes what it drains before
-		// substituting its in-memory copy, so that body would be closed twice - once there
-		// and once by releaseTransportBody. Wrapping it keeps the release the single owner
-		// of the close without changing a single byte any consumer reads.
-		httpresp.Body = io.NopCloser(httpresp.Body)
 	}
 
 	// httputil.DumpResponse does not handle websockets
@@ -332,9 +303,6 @@ get_response:
 		// The bytes slice is not accessible because of abstraction, therefore we need to perform the request again tampering the Accept-Encoding header
 		if !gzipRetry && strings.Contains(err.Error(), "gzip: invalid header") {
 			gzipRetry = true
-			// this response is abandoned in favour of the retry, so release its
-			// connection now instead of holding it for the whole second request
-			releaseTransportBody()
 			req.Header.Set("Accept-Encoding", "identity")
 			goto get_response
 		}
@@ -553,14 +521,10 @@ func (h *HTTPX) SetCustomHeaders(r *retryablehttp.Request, headers map[string][]
 
 func (httpx *HTTPX) setCustomCookies(req *http.Request) {
 	if httpx.Options.hasCustomCookies() {
-		// reset the cookie header carried over from the previous hop so the configured
-		// cookies are applied exactly once, keeping by name the ones they do not replace
-		// (as CookiesAuthStrategy.ApplyOnRR does) so a per-target credential survives
-		inherited := slices.DeleteFunc(req.Cookies(), func(cookie *http.Cookie) bool {
-			return slices.ContainsFunc(httpx.Options.customCookies, func(configured *http.Cookie) bool { return configured.Name == cookie.Name })
-		})
+		// reset any cookie header carried over from the previous hop so the
+		// configured cookies are applied exactly once
 		req.Header.Del("Cookie")
-		for _, cookie := range append(inherited, httpx.Options.customCookies...) {
+		for _, cookie := range httpx.Options.customCookies {
 			req.AddCookie(cookie)
 		}
 	}

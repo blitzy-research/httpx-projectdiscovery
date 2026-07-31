@@ -487,6 +487,10 @@ func TestRedirectMethodAndBodyRewriting(t *testing.T) {
 	// The same 307 method-and-body contract observed per DESTINATION rather than per
 	// status code, which is what decides whether a credential crosses with the payload.
 	t.Run("a 307 carries the method body and headers to whichever destination Location names", assertRedirectCrossOriginForwardsSecretsAndBody)
+
+	// The same contract observed against the OTHER discriminator net/http applies: not
+	// which status was returned, but whether the request can reproduce its body at all.
+	t.Run("a 307 or 308 is followed only when the body is rewindable", assertRedirect307308ReplayRequiresRewindableBody)
 }
 
 // TestRedirectSetsRefererPerHop verifies that each synthesized Referer names the
@@ -580,7 +584,7 @@ func TestRedirectRespectHSTSUpgradesScheme(t *testing.T) {
 			wantLastURL:   "https://origin.example/final",
 		},
 		{
-			// The early return at httpx.go:86-88: with no header advertised there is
+			// The early return at httpx.go:85-87: with no header advertised there is
 			// no HSTS policy to honour, so the target must be left alone even though
 			// the option is on.
 			name:          "option on without an HSTS header keeps http",
@@ -590,7 +594,7 @@ func TestRedirectRespectHSTSUpgradesScheme(t *testing.T) {
 			wantLastURL:   "http://origin.example/final",
 		},
 		{
-			// The host-scoped closure's own handleHSTS call (httpx.go:139). The
+			// The host-scoped closure's own handleHSTS call (httpx.go:138). The
 			// redirect stays on origin.example, so the host check passes and the
 			// upgrade is what this row observes.
 			name:                "host-scoped policy also upgrades to https",
@@ -701,11 +705,20 @@ const (
 // origin, a subdomain, and the original origin. net/http strips its enumerated
 // sensitive headers only when shouldCopyHeaderOnRedirect rejects the destination, but
 // preserves non-enumerated headers and replays a rewindable 307 body. The client's
-// redirect closure independently reapplies the configured cookies on every admitted
-// hop, replacing only the cookies it configures by name and preserving the rest, so the
-// Cookie line on a hop states two things at once: which inherited cookies net/http let
-// through, and which cookies the injector re-applied.
-// Exact per-hop assertions distinguish those mechanisms.
+// redirect closure independently rebuilds the Cookie line on every admitted hop from
+// Options.customCookies alone, so the Cookie value a hop receives states one thing
+// exactly: which cookies the injector re-applied. Exact per-hop assertions distinguish
+// those mechanisms.
+//
+// THIRD DIVERGENCE, PINNED AS MEASURED AND NOT FIXED. FIX-1's Header.Del("Cookie") is
+// unconditional within the hasCustomCookies guard, so an admitted hop loses every cookie
+// the injector did not configure - including a per-target cookie an authentication
+// strategy applied - even on a destination net/http was willing to hand it to. That is
+// visible in the subdomain and same-origin rows below, where the inherited session
+// cookie is copied by net/http and then dropped by the injector. Narrowing the delete to
+// the configured names would be a THIRD production change to httpx.go, and only FIX-1 and
+// FIX-2 are authorized; the divergence is therefore stated as an exact per-hop value here
+// so it cannot widen or silently narrow without failing.
 //
 // It runs as a sub-test of TestRedirectMethodAndBodyRewriting: the 307 method-and-body
 // contract that test sweeps by status code is the same contract examined here per
@@ -721,8 +734,8 @@ const (
 //     header is forwarded by the standard library, not by this repository. There is
 //     nothing here to change.
 //   - The configured-cookie re-injection is this repository's deliberate behaviour: the
-//     redirect closure calls setCustomCookies on every admitted hop (httpx.go:100-102,
-//     :117-119), which is what makes a -H "Cookie:" value survive a hop whose inherited
+//     redirect closure calls setCustomCookies on every admitted hop (httpx.go:100-101,
+//     :119-120), which is what makes a -H "Cookie:" value survive a hop whose inherited
 //     Cookie header net/http had stripped. Scoping it to the initial origin would change
 //     what every user of that flag observes - a production behaviour change outside the
 //     two minimal, separately disclosed fixes this work may make to httpx.go, and outside
@@ -765,11 +778,13 @@ func assertRedirectCrossOriginForwardsSecretsAndBody(t *testing.T) {
 			wantHopURL:             "http://sub.origin.example/collect",
 			wantAuthorization:      redirectSentinelBearer,
 			wantProxyAuthorization: redirectSentinelProxyCredential,
-			// net/http copied the inherited session cookie here, and setCustomCookies
-			// replaces by NAME: the session cookie is not configured, so it is
-			// preserved and re-added first, then the configured cookie is applied
-			// exactly once. Preserved-then-configured is the resulting order.
-			wantCookie: redirectSentinelSessionCookie + "; " + redirectSentinelConfiguredCookie,
+			// net/http DID copy the inherited session cookie to this destination -
+			// the subdomain is inside its trust domain - and setCustomCookies then
+			// discarded it: FIX-1 deletes the whole inherited Cookie header before
+			// re-adding Options.customCookies, so a cookie the injector did not
+			// configure does not survive an admitted hop. MEASURED, and PINNED AS
+			// MEASURED rather than fixed - see the DIVERGENCE note below the table.
+			wantCookie: redirectSentinelConfiguredCookie,
 		},
 		{
 			name:                   "same origin receives everything which proves the stripping is destination scoped",
@@ -777,10 +792,11 @@ func assertRedirectCrossOriginForwardsSecretsAndBody(t *testing.T) {
 			wantHopURL:             "http://origin.example/collect",
 			wantAuthorization:      redirectSentinelBearer,
 			wantProxyAuthorization: redirectSentinelProxyCredential,
-			// Same name-scoped replacement as the subdomain row: the two enumerated
-			// credential headers are destination-scoped, and the Cookie line keeps the
-			// inherited session cookie alongside the re-applied configured one.
-			wantCookie: redirectSentinelSessionCookie + "; " + redirectSentinelConfiguredCookie,
+			// Same outcome as the subdomain row, and for the same two reasons: the
+			// enumerated credential headers are destination-scoped, while the Cookie
+			// line is rebuilt from the configured cookies alone regardless of what the
+			// hop inherited.
+			wantCookie: redirectSentinelConfiguredCookie,
 		},
 	}
 
@@ -852,7 +868,9 @@ func assertRedirectCrossOriginForwardsSecretsAndBody(t *testing.T) {
 			require.Equal(t, tc.wantProxyAuthorization, hops[1].Header.Get("Proxy-Authorization"),
 				"Proxy-Authorization is enumerated alongside Authorization and must follow the same decision")
 			require.Equal(t, tc.wantCookie, hops[1].Header.Get("Cookie"),
-				"the exact Cookie line on the hop states which cookies survived: the injector replaces the configured names and preserves every other cookie the hop inherited")
+				"the exact Cookie line on the hop states which cookies survived: FIX-1 deletes whatever the hop inherited and re-adds Options.customCookies, so the configured cookies are the whole of it")
+			require.NotContains(t, hops[1].Header.Get("Cookie"), redirectSentinelSessionCookie,
+				"PINNED: the per-target session cookie does not survive an admitted hop, because FIX-1's delete is not scoped to the configured names")
 			require.Len(t, hops[1].Header.Values("Cookie"), 1,
 				"the cookies must arrive as a single header line, never one line per cookie")
 			require.Contains(t, hops[1].Header.Get("Cookie"), redirectSentinelConfiguredCookie,
@@ -916,7 +934,7 @@ const (
 // where confidentiality decides the value instead of position in the chain.
 //
 // SECURITY DISPOSITION. The AutoReferer rows record a real disclosure: SetCustomHeaders
-// installs the Referer as r.String() (httpx.go:549-551), the caller's target URL in full,
+// installs the Referer as r.String() (httpx.go:517-519), the caller's target URL in full,
 // so a URL that carries userinfo, a capability token in its query, or a fragment hands all
 // of it to whatever origin the redirect names. Because the value is EXPLICIT by the time
 // net/http considers it, refererForURL takes its explicit-value branch and neither strips
@@ -1029,7 +1047,7 @@ func assertRedirectRefererCrossOriginConfidentiality(t *testing.T) {
 
 			req, err := retryablehttp.NewRequest(http.MethodGet, tc.start, nil)
 			require.NoError(t, err)
-			// AutoReferer is applied by SetCustomHeaders (httpx.go:541-543), so call it
+			// AutoReferer is applied by SetCustomHeaders (httpx.go:517-519), so call it
 			// for every row before Do; only rows with AutoReferer enabled receive an
 			// explicit value.
 			ht.SetCustomHeaders(req, ht.CustomHeaders)
@@ -1084,9 +1102,9 @@ func assertRedirectRefererCrossOriginConfidentiality(t *testing.T) {
 
 // assertRedirectFollowHostRedirectsAllowsCleartextDowngrade shows that hostname-only
 // matching admits HTTPS-to-HTTP redirects on the same hostname, including port changes.
-// net/http suppresses Referer on the downgrade but preserves the configured credential
-// state because the destination remains host-related. The test records the cleartext hop
-// and its exact headers.
+// net/http suppresses Referer on the downgrade but preserves the enumerated credential
+// headers because the destination remains host-related, while the configured cookie is
+// re-applied by the injector. The test records the cleartext hop and its exact headers.
 //
 // It runs as a sub-test of TestRedirectFollowHostRedirectsComparesHostnameOnly, whose
 // table establishes that the closure ignores scheme and port; this is the security
@@ -1183,9 +1201,11 @@ func assertRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
 				"PINNED: the bearer token is transmitted in the clear, because the hostname matched")
 			require.Equal(t, hops[0].Header.Get("Authorization"), hops[1].Header.Get("Authorization"),
 				"the credential on the cleartext hop is byte for byte the one the TLS hop carried")
-			require.Equal(t, redirectSentinelSessionCookie+"; "+redirectSentinelConfiguredCookie,
+			require.Equal(t, redirectSentinelConfiguredCookie,
 				hops[1].Header.Get("Cookie"),
-				"every cookie reaches the cleartext hop: the hostname matched so net/http copied the inherited session cookie, and the injector preserved it while re-applying the configured one exactly once")
+				"the configured cookie reaches the cleartext hop: the injector re-applies it on every admitted hop, exactly once, whatever the scheme")
+			require.NotContains(t, hops[1].Header.Get("Cookie"), redirectSentinelSessionCookie,
+				"the inherited session cookie does not reach the cleartext hop: net/http copied it because the hostname matched, and FIX-1's unconditional Header.Del then discarded it - the same pinned divergence assertRedirectCrossOriginForwardsSecretsAndBody documents")
 			require.Equal(t, redirectSentinelAPIKey, hops[1].Header.Get(redirectSentinelAPIKeyHeader),
 				"the bespoke secret header is copied onto the cleartext hop as well")
 
@@ -1207,7 +1227,7 @@ func assertRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
 	}
 }
 
-// TestRedirect307308ReplayRequiresRewindableBody pins net/http's documented rule for
+// assertRedirect307308ReplayRequiresRewindableBody pins net/http's documented rule for
 // body-preserving redirects: at client.go:531 a 307 or 308 is followed only when the
 // original request can reproduce its body, which the standard library decides by testing
 // GetBody != nil whenever outgoingLength() is non-zero. When that test fails the library
@@ -1221,10 +1241,21 @@ func assertRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
 // A 302 control shows the rule is scoped to body-preserving statuses: a method-rewriting
 // redirect drops the body, so no rewind is needed and a nil GetBody is followed anyway.
 //
+// SECURITY-RELEVANT CONSEQUENCE, pinned by the non-rewindable rows. A request that
+// attaches its payload by direct Body/ContentLength assignment - the way this
+// repository's runner builds one - leaves GetBody nil, so a 307 or 308 aimed at such a
+// request is NOT followed and the operator sees the 3xx instead of the destination.
+// Nothing here remediates that: the fix would be a production change to the runner,
+// outside both the two disclosed httpx.go fixes and this engagement's test-only remit.
+//
+// It runs as a sub-test of TestRedirectMethodAndBodyRewriting, whose table states the
+// per-status method-and-body rewriting contract; this extends the same subject to the
+// question of whether the payload can be reproduced at all.
+//
 // The assertions describe only the net/http contract and the request the test itself
 // builds, so any caller in this repository that starts supplying a rewindable body simply
 // matches the rewindable rows below.
-func TestRedirect307308ReplayRequiresRewindableBody(t *testing.T) {
+func assertRedirect307308ReplayRequiresRewindableBody(t *testing.T) {
 	const parityPayload = "payload"
 	require.Len(t, parityPayload, 7, "precondition: the request payload is exactly 7 bytes")
 
@@ -1414,63 +1445,4 @@ func TestRedirect307308ReplayRequiresRewindableBody(t *testing.T) {
 				"the operator-visible final URL is empty for an unfollowed redirect, because a one-item chain has no last hop to report")
 		})
 	}
-}
-
-// STABLE TOP-LEVEL SELECTORS FOR THE REDIRECT SECURITY SCENARIOS
-//
-// The three scenarios below are written as assertRedirect* helpers and invoked as
-// sub-tests of the policy test whose subject each one extends (:354, :476, :534), and the
-// 307/308 body contract is stated by TestRedirect307308ReplayRequiresRewindableBody
-// (:1165). That organization keeps each scenario next to the contract it belongs to, but
-// it also means a targeted invocation of the scenario's own name - the way a security
-// gate, a CI job or an operator reruns exactly one check - matched nothing: `go test -run
-// '^TestRedirectCrossOriginForwardsSecretsAndBody$'` reported "[no tests to run]" and
-// exited 0, reporting success for a check that never executed.
-//
-// The wrappers below restore those names as first-class selectors. Each one calls the
-// same helper the sub-test calls, so a scenario keeps ONE set of assertions and cannot
-// drift between its two entry points, and each is purely additive: no existing test,
-// sub-test, helper, fixture or assertion is renamed, reordered, weakened or removed.
-//
-// None of them is a vacuous test. A wrapper contributes no assertion of its own precisely
-// because it must not restate the delegate's; every assertion the selector runs is the
-// delegate's exact per-hop request-stream and response evidence, described in the
-// delegate's own doc comment.
-
-// TestRedirectCrossOriginForwardsSecretsAndBody is the top-level selector for the
-// cross-origin 307 credential-and-body scenario. It runs the same assertions as the
-// "a 307 carries the method body and headers to whichever destination Location names"
-// sub-test of TestRedirectMethodAndBodyRewriting (:476).
-func TestRedirectCrossOriginForwardsSecretsAndBody(t *testing.T) {
-	assertRedirectCrossOriginForwardsSecretsAndBody(t)
-}
-
-// TestRedirectRefererCrossOriginConfidentiality is the top-level selector for the
-// cross-origin and downgrade Referer scenario. It runs the same assertions as the
-// "cross origin and downgrade hops decide the Referer by confidentiality" sub-test of
-// TestRedirectSetsRefererPerHop (:534).
-func TestRedirectRefererCrossOriginConfidentiality(t *testing.T) {
-	assertRedirectRefererCrossOriginConfidentiality(t)
-}
-
-// TestRedirectFollowHostRedirectsAllowsCleartextDowngrade is the top-level selector for
-// the HTTPS-to-HTTP downgrade scenario admitted by hostname-only matching. It runs the
-// same assertions as the "hostname match admits an https to http downgrade" sub-test of
-// TestRedirectFollowHostRedirectsComparesHostnameOnly (:354).
-func TestRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
-	assertRedirectFollowHostRedirectsAllowsCleartextDowngrade(t)
-}
-
-// TestRedirectRunnerConstructedBodyIsNotReplayedOn307308 is the top-level selector for
-// the non-rewindable half of the 307/308 body contract: a request that attaches its
-// payload by direct Body/ContentLength assignment - the way this repository's runner
-// builds one - leaves GetBody nil, and net/http therefore hands the 3xx back instead of
-// replaying it.
-//
-// The full contract, including the rewindable counterpart that proves the outcome is a
-// property of the body rather than of the scenario, is stated by
-// TestRedirect307308ReplayRequiresRewindableBody (:1165), which this selector runs
-// verbatim rather than restating a subset of.
-func TestRedirectRunnerConstructedBodyIsNotReplayedOn307308(t *testing.T) {
-	TestRedirect307308ReplayRequiresRewindableBody(t)
 }

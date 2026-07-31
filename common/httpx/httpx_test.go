@@ -186,7 +186,7 @@ func TestDoSwitchingProtocolsDoesNotHang(t *testing.T) {
 //
 // Do must never read the body of a protocol switch: after the 101 headers the bytes belong
 // to the upgraded protocol, which is why the status is in Do's skip set
-// (common/httpx/httpx.go:300, and the guarded read at :340-346). Any read is therefore a
+// (common/httpx/httpx.go:279, and the guarded read at :316-322). Any read is therefore a
 // defect, and naming it with a sentinel turns that defect into an immediate, attributable
 // error instead of a symptom to be diagnosed.
 var errUnexpected101BodyRead = errors.New("101 Switching Protocols body was read")

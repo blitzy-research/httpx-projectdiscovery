@@ -708,7 +708,7 @@ const mockClientTimeout = 2 * time.Second
 // option a test sets, and no field it mutates afterwards, can be observed by any other
 // test. That matters most for the redirect-policy tests, where the CheckRedirect
 // closure New installs captures the *Options pointer it was built with
-// (common/httpx/httpx.go:77, :99-144) - a client shared between two tests would let one
+// (common/httpx/httpx.go:76, :92-143) - a client shared between two tests would let one
 // row's MaxRedirects describe another row's assertions.
 //
 // Running mut before construction is mandatory, not stylistic. New parses
@@ -754,7 +754,7 @@ func newMockHTTPX(t *testing.T, mut func(*Options), rt http.RoundTripper) *HTTPX
 // allocates, at the end of the test that constructed the client.
 //
 // New unconditionally sets fastdialerOpts.WithDialerHistory = true
-// (common/httpx/httpx.go:65), and fastdialer answers that by opening a LevelDB store
+// (common/httpx/httpx.go:64), and fastdialer answers that by opening a LevelDB store
 // under a fresh os.MkdirTemp("", "httpx") directory. Nothing reclaims it implicitly:
 // only (*fastdialer.Dialer).Close closes the store, and only that close triggers the
 // os.RemoveAll that deletes the directory. A test that constructs a client and returns

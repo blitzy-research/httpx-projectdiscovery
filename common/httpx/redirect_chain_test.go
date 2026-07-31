@@ -659,7 +659,7 @@ func assertChainDumpsExposeSensitiveHeaders(t *testing.T) {
 	require.Equal(t, []int{http.StatusMovedPermanently, http.StatusOK}, resp.GetChainStatusCodes())
 	require.True(t, resp.HasChain())
 	require.Equal(t, chainTargetB, resp.GetChainLastURL(),
-		"the final URL is the plain target here; the credential-bearing case is TestChainRetainsURLUserinfoInCallerVisibleOutput")
+		"the final URL is the plain target here; the credential-bearing case is assertChainRetainsURLUserinfoInCallerVisibleOutput")
 	require.Equal(t, chainTargetB, slice[0].Location, "the resolved Location of the first hop")
 	require.Equal(t, "", slice[1].Location, "the terminal hop has no Location")
 	require.Equal(t, chainTargetA, slice[0].RequestURL)
@@ -845,34 +845,4 @@ func assertChainRetainsURLUserinfoInCallerVisibleOutput(t *testing.T) {
 				"stated as an absence so a change that stopped stripping the Referer fails here too")
 		})
 	}
-}
-
-// STABLE TOP-LEVEL SELECTORS FOR THE CHAIN EXPOSURE SCENARIOS
-//
-// Both scenarios below are written as assertChain* helpers and invoked as sub-tests of the
-// accessor test whose subject each one extends (:233, :385). That keeps each scenario next
-// to the accessor contract it belongs to, but it also means a targeted invocation of the
-// scenario's own name matched nothing: `go test -run '^TestChainDumpsExposeSensitiveHeaders$'`
-// reported "[no tests to run]" and exited 0, reporting success for a check that never ran.
-//
-// The wrappers restore those names as first-class selectors, each calling the same helper
-// the sub-test calls, so a scenario keeps ONE set of assertions and cannot drift between
-// its two entry points. They are purely additive: no existing test, sub-test, helper,
-// fixture or assertion is renamed, reordered, weakened or removed. Neither is a vacuous
-// test - every assertion the selector runs is the delegate's exact dump-byte, accessor and
-// per-hop header evidence, described in the delegate's own doc comment.
-
-// TestChainDumpsExposeSensitiveHeaders is the top-level selector for the chain-dump
-// credential-retention scenario. It runs the same assertions as the "the dumps retain
-// request and response headers verbatim" sub-test of TestChainDumpsCarryNoBody (:385).
-func TestChainDumpsExposeSensitiveHeaders(t *testing.T) {
-	assertChainDumpsExposeSensitiveHeaders(t)
-}
-
-// TestChainRetainsURLUserinfoInCallerVisibleOutput is the top-level selector for the URL
-// userinfo scenario. It runs the same assertions as the "a credential in the target URL
-// reaches the accessors when Location is relative" sub-test of TestChainAccessorsMultiHop
-// (:233).
-func TestChainRetainsURLUserinfoInCallerVisibleOutput(t *testing.T) {
-	assertChainRetainsURLUserinfoInCallerVisibleOutput(t)
 }
