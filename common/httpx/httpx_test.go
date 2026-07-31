@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -180,6 +181,51 @@ func TestDoSwitchingProtocolsDoesNotHang(t *testing.T) {
 	}
 }
 
+// errUnexpected101BodyRead is reported by the body of the fail-fast 101 fixture below the
+// moment anything reads it.
+//
+// Do must never read the body of a protocol switch: after the 101 headers the bytes belong
+// to the upgraded protocol, which is why the status is in Do's skip set
+// (common/httpx/httpx.go:300, and the guarded read at :340-346). Any read is therefore a
+// defect, and naming it with a sentinel turns that defect into an immediate, attributable
+// error instead of a symptom to be diagnosed.
+var errUnexpected101BodyRead = errors.New("101 Switching Protocols body was read")
+
+// switchingProtocolsFailFastRoundTripper answers with the same 101 response as
+// switchingProtocolsRoundTripper (:137) but pairs it with a body that FAILS on first read
+// instead of blocking forever.
+//
+// The difference is what keeps the failure bounded, and it is the reason this fixture exists
+// alongside the other rather than replacing it. blockingReadCloser (:127) parks in a Read
+// that no client timeout can interrupt - correct for the anti-hang regression test next to
+// it, whose whole subject is that Do returns anyway - but wrong for a test that asserts the
+// protocol-visible outcome: if a defect dropped 101 from Do's skip set, io.ReadAll on a
+// blocking body would stall this test until the go test package timeout (10 minutes by
+// default) and report a panic rather than a failed assertion. errReadCloser
+// (common/httpx/mocktransport_test.go) returns the sentinel on first read instead, so the
+// same defect surfaces as an immediate, named error out of Do and the assertion below fails
+// in microseconds.
+//
+// Both existing fixtures and the existing test that uses them are left exactly as they are;
+// this one is purely additional.
+type switchingProtocolsFailFastRoundTripper struct{}
+
+func (switchingProtocolsFailFastRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		Status:     "101 Switching Protocols",
+		StatusCode: http.StatusSwitchingProtocols,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header: http.Header{
+			"Upgrade":    {"websocket"},
+			"Connection": {"Upgrade"},
+		},
+		Body:    &errReadCloser{err: errUnexpected101BodyRead},
+		Request: req,
+	}, nil
+}
+
 // TestDoSwitchingProtocolsProtocolVisibleOutcome verifies that a 101 response
 // preserves its status and upgrade headers while exposing no HTTP response body.
 func TestDoSwitchingProtocolsProtocolVisibleOutcome(t *testing.T) {
@@ -190,10 +236,16 @@ func TestDoSwitchingProtocolsProtocolVisibleOutcome(t *testing.T) {
 
 	ht, err := New(&options)
 	require.NoError(t, err)
+	// Release the disk-backed dialer history this construction allocated; see
+	// registerDialerCleanup for why leaving it behind slows every later New down.
+	registerDialerCleanup(t, ht)
 
 	// Install the mock on both retryable transports because malformed HTTP/1.x
-	// responses may fall back to HTTPClient2.
-	rt := switchingProtocolsRoundTripper{}
+	// responses may fall back to HTTPClient2. The fail-fast fixture is used deliberately
+	// rather than switchingProtocolsRoundTripper: see its doc comment for why a body that
+	// blocks would turn the most direct defect in this path into a package-wide hang
+	// instead of a failed assertion.
+	rt := switchingProtocolsFailFastRoundTripper{}
 	ht.client.HTTPClient.Transport = rt
 	ht.client.HTTPClient2.Transport = rt
 
@@ -202,6 +254,8 @@ func TestDoSwitchingProtocolsProtocolVisibleOutcome(t *testing.T) {
 	require.NoError(t, err)
 
 	resp, err := ht.Do(req, UnsafeOptions{})
+	require.NotErrorIs(t, err, errUnexpected101BodyRead,
+		"Do must not read the body of a protocol switch: this failure means 101 was lost from the skip set in Do")
 	require.NoError(t, err)
 
 	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode,

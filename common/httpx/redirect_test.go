@@ -35,9 +35,6 @@ func TestRedirectDefaultDoesNotFollow(t *testing.T) {
 	// A nil mutator keeps DefaultOptions' FollowRedirects and FollowHostRedirects
 	// false, which is exactly what selects the default closure inside New.
 	ht := newMockHTTPX(t, nil, rt)
-	// Close the disk-backed fastdialer state created by New; the mock transport bypasses
-	// it but does not disable its resources.
-	t.Cleanup(ht.Dialer.Close)
 
 	req, err := retryablehttp.NewRequest(http.MethodGet, "http://origin.example/a", nil)
 	require.NoError(t, err)
@@ -157,7 +154,7 @@ func TestRedirectMaxRedirectsBudget(t *testing.T) {
 			wantStatusCodes: []int{http.StatusFound, http.StatusFound, http.StatusFound, http.StatusOK},
 		},
 		{
-			// The host-scoped closure has its own budget guard at httpx.go:132;
+			// The host-scoped closure has its own budget guard at httpx.go:133;
 			// same-host hops isolate that guard from the hostname check.
 			name:                "host-scoped budget 1 still follows no hop",
 			followHostRedirects: true,
@@ -204,7 +201,6 @@ func TestRedirectMaxRedirectsBudget(t *testing.T) {
 				}
 				options.MaxRedirects = tc.maxRedirects
 			}, rt)
-			t.Cleanup(ht.Dialer.Close)
 
 			req, err := retryablehttp.NewRequest(http.MethodGet, "http://origin.example/0", nil)
 			require.NoError(t, err)
@@ -327,7 +323,6 @@ func TestRedirectFollowHostRedirectsComparesHostnameOnly(t *testing.T) {
 				options.FollowHostRedirects = true
 				options.MaxRedirects = 10
 			}, rt)
-			t.Cleanup(ht.Dialer.Close)
 
 			req, err := retryablehttp.NewRequest(http.MethodGet, "http://origin.example/start", nil)
 			require.NoError(t, err)
@@ -353,6 +348,10 @@ func TestRedirectFollowHostRedirectsComparesHostnameOnly(t *testing.T) {
 			require.Equal(t, tc.wantStatusCodes, resp.GetChainStatusCodes())
 		})
 	}
+
+	// The security consequence of comparing the hostname alone: a scheme change is
+	// admitted, so an https target can be walked down to cleartext on the same host.
+	t.Run("hostname match admits an https to http downgrade", assertRedirectFollowHostRedirectsAllowsCleartextDowngrade)
 }
 
 // TestRedirectMethodAndBodyRewriting verifies net/http's behavior for this POST: 301,
@@ -433,7 +432,6 @@ func TestRedirectMethodAndBodyRewriting(t *testing.T) {
 				options.FollowRedirects = true
 				options.MaxRedirects = 10
 			}, rt)
-			t.Cleanup(ht.Dialer.Close)
 
 			req, err := retryablehttp.NewRequest(http.MethodPost, "http://origin.example/a", strings.NewReader(payload))
 			require.NoError(t, err)
@@ -472,6 +470,10 @@ func TestRedirectMethodAndBodyRewriting(t *testing.T) {
 			require.Equal(t, "http://origin.example/b", resp.GetChainLastURL())
 		})
 	}
+
+	// The same 307 method-and-body contract observed per DESTINATION rather than per
+	// status code, which is what decides whether a credential crosses with the payload.
+	t.Run("a 307 carries the method body and headers to whichever destination Location names", assertRedirectCrossOriginForwardsSecretsAndBody)
 }
 
 // TestRedirectSetsRefererPerHop verifies that each synthesized Referer names the
@@ -490,7 +492,6 @@ func TestRedirectSetsRefererPerHop(t *testing.T) {
 		options.FollowRedirects = true
 		options.MaxRedirects = 10
 	}, rt)
-	t.Cleanup(ht.Dialer.Close)
 
 	req, err := retryablehttp.NewRequest(http.MethodGet, "http://origin.example/a", nil)
 	require.NoError(t, err)
@@ -527,6 +528,10 @@ func TestRedirectSetsRefererPerHop(t *testing.T) {
 	require.Equal(t, []byte("three"), resp.Data)
 	require.Equal(t, []int{http.StatusFound, http.StatusFound, http.StatusOK}, resp.GetChainStatusCodes())
 	require.Equal(t, "http://origin.example/c", resp.GetChainLastURL())
+
+	// Position in the chain decides the Referer above; confidentiality decides it once
+	// the hop crosses an origin or drops to cleartext.
+	t.Run("cross origin and downgrade hops decide the Referer by confidentiality", assertRedirectRefererCrossOriginConfidentiality)
 }
 
 // TestRedirectRespectHSTSUpgradesScheme verifies this client's RespectHSTS behavior:
@@ -562,7 +567,7 @@ func TestRedirectRespectHSTSUpgradesScheme(t *testing.T) {
 			wantLastURL:   "https://origin.example/final",
 		},
 		{
-			// The early return at httpx.go:85-87: with no header advertised there is
+			// The early return at httpx.go:86-88: with no header advertised there is
 			// no HSTS policy to honour, so the target must be left alone even though
 			// the option is on.
 			name:          "option on without an HSTS header keeps http",
@@ -572,7 +577,7 @@ func TestRedirectRespectHSTSUpgradesScheme(t *testing.T) {
 			wantLastURL:   "http://origin.example/final",
 		},
 		{
-			// The host-scoped closure's own handleHSTS call (httpx.go:138). The
+			// The host-scoped closure's own handleHSTS call (httpx.go:139). The
 			// redirect stays on origin.example, so the host check passes and the
 			// upgrade is what this row observes.
 			name:                "host-scoped policy also upgrades to https",
@@ -614,7 +619,6 @@ func TestRedirectRespectHSTSUpgradesScheme(t *testing.T) {
 				options.MaxRedirects = 10
 				options.RespectHSTS = tc.respectHSTS
 			}, rt)
-			t.Cleanup(ht.Dialer.Close)
 
 			req, err := retryablehttp.NewRequest(http.MethodGet, "http://origin.example/a", nil)
 			require.NoError(t, err)
@@ -680,15 +684,20 @@ const (
 	redirectSentinelReferer     = "http://origin.example/start"
 )
 
-// TestRedirectCrossOriginForwardsSecretsAndBody records a 307 redirect to an unrelated
+// assertRedirectCrossOriginForwardsSecretsAndBody records a 307 redirect to an unrelated
 // origin, a subdomain, and the original origin. net/http strips its enumerated
 // sensitive headers only when shouldCopyHeaderOnRedirect rejects the destination, but
 // preserves non-enumerated headers and replays a rewindable 307 body. The client's
-// redirect closure independently resets the Cookie header and reapplies the configured
-// cookies on every admitted hop, which is why the Cookie line is the same on all three
-// destinations while the enumerated credential headers are not.
+// redirect closure independently reapplies the configured cookies on every admitted
+// hop, replacing only the cookies it configures by name and preserving the rest, so the
+// Cookie line on a hop states two things at once: which inherited cookies net/http let
+// through, and which cookies the injector re-applied.
 // Exact per-hop assertions distinguish those mechanisms.
-func TestRedirectCrossOriginForwardsSecretsAndBody(t *testing.T) {
+//
+// It runs as a sub-test of TestRedirectMethodAndBodyRewriting: the 307 method-and-body
+// contract that test sweeps by status code is the same contract examined here per
+// destination, so the two belong under one subject.
+func assertRedirectCrossOriginForwardsSecretsAndBody(t *testing.T) {
 	require.Len(t, redirectSentinelBody, 21, "precondition: the sentinel payload is exactly 21 bytes")
 
 	cases := []struct {
@@ -711,9 +720,8 @@ func TestRedirectCrossOriginForwardsSecretsAndBody(t *testing.T) {
 			wantAuthorization:      "",
 			wantProxyAuthorization: "",
 			// net/http stripped the inherited session cookie with the rest of the
-			// enumerated set, and setCustomCookies would not have restored it anyway:
-			// it deletes the whole Cookie header before re-adding only the configured
-			// cookies, so the configured cookie is all that remains.
+			// enumerated set, so there is nothing for the injector to preserve and the
+			// re-injected configured cookie is all that remains.
 			wantCookie: redirectSentinelConfiguredCookie,
 		},
 		{
@@ -724,10 +732,11 @@ func TestRedirectCrossOriginForwardsSecretsAndBody(t *testing.T) {
 			wantHopURL:             "http://sub.origin.example/collect",
 			wantAuthorization:      redirectSentinelBearer,
 			wantProxyAuthorization: redirectSentinelProxyCredential,
-			// net/http copied the inherited session cookie here, yet the hop still
-			// carries only the configured one: setCustomCookies deletes the inherited
-			// Cookie header wholesale and re-adds only Options.customCookies.
-			wantCookie: redirectSentinelConfiguredCookie,
+			// net/http copied the inherited session cookie here, and setCustomCookies
+			// replaces by NAME: the session cookie is not configured, so it is
+			// preserved and re-added first, then the configured cookie is applied
+			// exactly once. Preserved-then-configured is the resulting order.
+			wantCookie: redirectSentinelSessionCookie + "; " + redirectSentinelConfiguredCookie,
 		},
 		{
 			name:                   "same origin receives everything which proves the stripping is destination scoped",
@@ -735,10 +744,10 @@ func TestRedirectCrossOriginForwardsSecretsAndBody(t *testing.T) {
 			wantHopURL:             "http://origin.example/collect",
 			wantAuthorization:      redirectSentinelBearer,
 			wantProxyAuthorization: redirectSentinelProxyCredential,
-			// Same reset as the subdomain row: the two enumerated credential headers
-			// are destination-scoped, but the Cookie line is not - it is rebuilt from
-			// the configured cookies on every admitted hop.
-			wantCookie: redirectSentinelConfiguredCookie,
+			// Same name-scoped replacement as the subdomain row: the two enumerated
+			// credential headers are destination-scoped, and the Cookie line keeps the
+			// inherited session cookie alongside the re-applied configured one.
+			wantCookie: redirectSentinelSessionCookie + "; " + redirectSentinelConfiguredCookie,
 		},
 	}
 
@@ -762,7 +771,6 @@ func TestRedirectCrossOriginForwardsSecretsAndBody(t *testing.T) {
 				// assertion would pass vacuously.
 				options.CustomHeaders = map[string][]string{"Cookie": {redirectSentinelConfiguredCookie}}
 			}, rt)
-			t.Cleanup(ht.Dialer.Close)
 
 			req, err := retryablehttp.NewRequest(http.MethodPost, redirectSentinelOriginStart, strings.NewReader(redirectSentinelBody))
 			require.NoError(t, err)
@@ -811,11 +819,15 @@ func TestRedirectCrossOriginForwardsSecretsAndBody(t *testing.T) {
 			require.Equal(t, tc.wantProxyAuthorization, hops[1].Header.Get("Proxy-Authorization"),
 				"Proxy-Authorization is enumerated alongside Authorization and must follow the same decision")
 			require.Equal(t, tc.wantCookie, hops[1].Header.Get("Cookie"),
-				"the exact Cookie line on the hop states which cookies were re-injected: the reset drops every inherited cookie, so only the configured one is left")
+				"the exact Cookie line on the hop states which cookies survived: the injector replaces the configured names and preserves every other cookie the hop inherited")
 			require.Len(t, hops[1].Header.Values("Cookie"), 1,
 				"the cookies must arrive as a single header line, never one line per cookie")
 			require.Contains(t, hops[1].Header.Get("Cookie"), redirectSentinelConfiguredCookie,
 				"PINNED: the configured cookie is re-injected on every destination, origin change included")
+			require.NotContains(t, hops[1].Header.Get("Cookie"), redirectSentinelConfiguredCookie+"; "+redirectSentinelConfiguredCookie,
+				"the configured cookie must be applied exactly once per hop, never appended to the value inherited from the previous hop")
+			require.Equal(t, 1, strings.Count(hops[1].Header.Get("Cookie"), redirectSentinelConfiguredCookie),
+				"the configured cookie must appear exactly once per hop, never re-appended on top of the inherited value")
 
 			require.Equal(t, redirectSentinelAPIKey, hops[1].Header.Get(redirectSentinelAPIKeyHeader),
 				"PINNED: a non-enumerated secret header is copied to every destination, including an unrelated origin")
@@ -860,12 +872,16 @@ const (
 	redirectSentinelSecureTarget    = "https://other.example/collect"
 )
 
-// TestRedirectRefererCrossOriginConfidentiality records the Referer received after
+// assertRedirectRefererCrossOriginConfidentiality records the Referer received after
 // cross-origin and HTTPS-to-HTTP redirects. net/http suppresses a synthesized Referer
 // on HTTPS-to-HTTP, preserves an explicit Referer, and otherwise strips URL userinfo
 // while retaining path, query, and fragment. AutoReferer supplies an explicit value
 // before Do, so the table distinguishes synthesized and explicit behavior.
-func TestRedirectRefererCrossOriginConfidentiality(t *testing.T) {
+//
+// It runs as a sub-test of TestRedirectSetsRefererPerHop, which establishes the per-hop
+// Referer contract on a same-origin chain; this extends the same subject to the cases
+// where confidentiality decides the value instead of position in the chain.
+func assertRedirectRefererCrossOriginConfidentiality(t *testing.T) {
 	cases := []struct {
 		name     string
 		start    string
@@ -960,11 +976,10 @@ func TestRedirectRefererCrossOriginConfidentiality(t *testing.T) {
 				options.MaxRedirects = 10
 				options.AutoReferer = tc.autoReferer
 			}, rt)
-			t.Cleanup(ht.Dialer.Close)
 
 			req, err := retryablehttp.NewRequest(http.MethodGet, tc.start, nil)
 			require.NoError(t, err)
-			// AutoReferer is applied by SetCustomHeaders (httpx.go:517-519), so call it
+			// AutoReferer is applied by SetCustomHeaders (httpx.go:541-543), so call it
 			// for every row before Do; only rows with AutoReferer enabled receive an
 			// explicit value.
 			ht.SetCustomHeaders(req, ht.CustomHeaders)
@@ -1017,12 +1032,16 @@ func TestRedirectRefererCrossOriginConfidentiality(t *testing.T) {
 	}
 }
 
-// TestRedirectFollowHostRedirectsAllowsCleartextDowngrade shows that hostname-only
+// assertRedirectFollowHostRedirectsAllowsCleartextDowngrade shows that hostname-only
 // matching admits HTTPS-to-HTTP redirects on the same hostname, including port changes.
 // net/http suppresses Referer on the downgrade but preserves the configured credential
 // state because the destination remains host-related. The test records the cleartext hop
 // and its exact headers.
-func TestRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
+//
+// It runs as a sub-test of TestRedirectFollowHostRedirectsComparesHostnameOnly, whose
+// table establishes that the closure ignores scheme and port; this is the security
+// consequence of that same comparison, so it belongs under the same subject.
+func assertRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
 	const secureStart = "https://origin.example/private"
 
 	cases := []struct {
@@ -1068,7 +1087,6 @@ func TestRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
 				options.MaxRedirects = 10
 				options.CustomHeaders = map[string][]string{"Cookie": {redirectSentinelConfiguredCookie}}
 			}, rt)
-			t.Cleanup(ht.Dialer.Close)
 
 			req, err := retryablehttp.NewRequest(http.MethodGet, secureStart, nil)
 			require.NoError(t, err)
@@ -1103,9 +1121,9 @@ func TestRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
 				"PINNED: the bearer token is transmitted in the clear, because the hostname matched")
 			require.Equal(t, hops[0].Header.Get("Authorization"), hops[1].Header.Get("Authorization"),
 				"the credential on the cleartext hop is byte for byte the one the TLS hop carried")
-			require.Equal(t, redirectSentinelConfiguredCookie,
+			require.Equal(t, redirectSentinelSessionCookie+"; "+redirectSentinelConfiguredCookie,
 				hops[1].Header.Get("Cookie"),
-				"the configured cookie is re-injected onto the cleartext hop; the inherited session cookie is dropped because the injector resets the Cookie header first")
+				"every cookie reaches the cleartext hop: the hostname matched so net/http copied the inherited session cookie, and the injector preserved it while re-applying the configured one exactly once")
 			require.Equal(t, redirectSentinelAPIKey, hops[1].Header.Get(redirectSentinelAPIKeyHeader),
 				"the bespoke secret header is copied onto the cleartext hop as well")
 
@@ -1127,23 +1145,34 @@ func TestRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
 	}
 }
 
-// TestRedirectRunnerConstructedBodyIsNotReplayedOn307308 compares runner-style direct
-// Body/ContentLength assignment with retryablehttp's buffered constructor. net/http
-// follows body-preserving 307/308 redirects only when the original request exposes
-// GetBody. The runner path leaves GetBody nil, so the 3xx response is returned without a
-// second hop; the buffered path replays the body. A 302 control shows method-rewriting
-// redirects do not require body rewind.
-func TestRedirectRunnerConstructedBodyIsNotReplayedOn307308(t *testing.T) {
+// TestRedirect307308ReplayRequiresRewindableBody pins net/http's documented rule for
+// body-preserving redirects: at client.go:531 a 307 or 308 is followed only when the
+// original request can reproduce its body, which the standard library decides by testing
+// GetBody != nil whenever outgoingLength() is non-zero. When that test fails the library
+// deliberately hands the 3xx back to the caller rather than erroring - the behaviour its
+// own comment there traces to Go 1.7.
+//
+// Each status is therefore exercised through both construction paths that a caller can
+// choose. Attaching a payload by direct Body/ContentLength assignment leaves GetBody nil
+// and the redirect is not followed; building the request through retryablehttp's buffered
+// constructor installs GetBody and the body is replayed byte for byte on the second hop.
+// A 302 control shows the rule is scoped to body-preserving statuses: a method-rewriting
+// redirect drops the body, so no rewind is needed and a nil GetBody is followed anyway.
+//
+// The assertions describe only the net/http contract and the request the test itself
+// builds, so any caller in this repository that starts supplying a rewindable body simply
+// matches the rewindable rows below.
+func TestRedirect307308ReplayRequiresRewindableBody(t *testing.T) {
 	const parityPayload = "payload"
 	require.Len(t, parityPayload, 7, "precondition: the request payload is exactly 7 bytes")
 
 	cases := []struct {
 		name   string
 		status int
-		// runnerConstructed selects the construction path: true reproduces
-		// runner/runner.go exactly, false uses the buffered constructor the library
-		// contract test uses.
-		runnerConstructed bool
+		// rewindableBody selects the construction path: false attaches the payload by
+		// direct field assignment (Body and ContentLength set, GetBody left nil), true
+		// uses retryablehttp's buffered constructor, which installs GetBody.
+		rewindableBody bool
 		// wantGetBodyNil is the discriminator net/http reads, asserted before the call.
 		wantGetBodyNil bool
 		// wantHopURLs is the whole observed request stream, so "the redirect was not
@@ -1161,84 +1190,85 @@ func TestRedirectRunnerConstructedBodyIsNotReplayedOn307308(t *testing.T) {
 		wantLastURL     string
 	}{
 		{
-			name:              "307 built the way the runner builds it is not followed at all",
-			status:            http.StatusTemporaryRedirect,
-			runnerConstructed: true,
-			wantGetBodyNil:    true,
-			wantHopURLs:       []string{"http://origin.example/a"},
-			wantHopMethods:    []string{http.MethodPost},
-			wantHopBodies:     []string{parityPayload},
-			wantStatus:        http.StatusTemporaryRedirect,
-			wantData:          "redirect",
-			wantLocation:      "/b",
-			wantChainLen:      1,
-			wantStatusCodes:   []int{http.StatusTemporaryRedirect},
-			wantLastURL:       "",
+			name:            "307 with a non-rewindable body is not followed at all",
+			status:          http.StatusTemporaryRedirect,
+			rewindableBody:  false,
+			wantGetBodyNil:  true,
+			wantHopURLs:     []string{"http://origin.example/a"},
+			wantHopMethods:  []string{http.MethodPost},
+			wantHopBodies:   []string{parityPayload},
+			wantStatus:      http.StatusTemporaryRedirect,
+			wantData:        "redirect",
+			wantLocation:    "/b",
+			wantChainLen:    1,
+			wantStatusCodes: []int{http.StatusTemporaryRedirect},
+			wantLastURL:     "",
 		},
 		{
 			// The same status, the same payload, the buffered constructor: followed and
 			// replayed. This row is what proves the row above is a property of the
-			// construction path and not of the scenario.
-			name:              "307 built with a rewindable body is followed and replayed",
-			status:            http.StatusTemporaryRedirect,
-			runnerConstructed: false,
-			wantGetBodyNil:    false,
-			wantHopURLs:       []string{"http://origin.example/a", "http://origin.example/b"},
-			wantHopMethods:    []string{http.MethodPost, http.MethodPost},
-			wantHopBodies:     []string{parityPayload, parityPayload},
-			wantStatus:        http.StatusOK,
-			wantData:          "final",
-			wantLocation:      "",
-			wantChainLen:      2,
-			wantStatusCodes:   []int{http.StatusTemporaryRedirect, http.StatusOK},
-			wantLastURL:       "http://origin.example/b",
+			// body's rewindability and not of the scenario.
+			name:            "307 with a rewindable body is followed and replayed",
+			status:          http.StatusTemporaryRedirect,
+			rewindableBody:  true,
+			wantGetBodyNil:  false,
+			wantHopURLs:     []string{"http://origin.example/a", "http://origin.example/b"},
+			wantHopMethods:  []string{http.MethodPost, http.MethodPost},
+			wantHopBodies:   []string{parityPayload, parityPayload},
+			wantStatus:      http.StatusOK,
+			wantData:        "final",
+			wantLocation:    "",
+			wantChainLen:    2,
+			wantStatusCodes: []int{http.StatusTemporaryRedirect, http.StatusOK},
+			wantLastURL:     "http://origin.example/b",
 		},
 		{
-			name:              "308 built the way the runner builds it is not followed at all",
-			status:            http.StatusPermanentRedirect,
-			runnerConstructed: true,
-			wantGetBodyNil:    true,
-			wantHopURLs:       []string{"http://origin.example/a"},
-			wantHopMethods:    []string{http.MethodPost},
-			wantHopBodies:     []string{parityPayload},
-			wantStatus:        http.StatusPermanentRedirect,
-			wantData:          "redirect",
-			wantLocation:      "/b",
-			wantChainLen:      1,
-			wantStatusCodes:   []int{http.StatusPermanentRedirect},
-			wantLastURL:       "",
+			name:            "308 with a non-rewindable body is not followed at all",
+			status:          http.StatusPermanentRedirect,
+			rewindableBody:  false,
+			wantGetBodyNil:  true,
+			wantHopURLs:     []string{"http://origin.example/a"},
+			wantHopMethods:  []string{http.MethodPost},
+			wantHopBodies:   []string{parityPayload},
+			wantStatus:      http.StatusPermanentRedirect,
+			wantData:        "redirect",
+			wantLocation:    "/b",
+			wantChainLen:    1,
+			wantStatusCodes: []int{http.StatusPermanentRedirect},
+			wantLastURL:     "",
 		},
 		{
-			name:              "308 built with a rewindable body is followed and replayed",
-			status:            http.StatusPermanentRedirect,
-			runnerConstructed: false,
-			wantGetBodyNil:    false,
-			wantHopURLs:       []string{"http://origin.example/a", "http://origin.example/b"},
-			wantHopMethods:    []string{http.MethodPost, http.MethodPost},
-			wantHopBodies:     []string{parityPayload, parityPayload},
-			wantStatus:        http.StatusOK,
-			wantData:          "final",
-			wantLocation:      "",
-			wantChainLen:      2,
-			wantStatusCodes:   []int{http.StatusPermanentRedirect, http.StatusOK},
-			wantLastURL:       "http://origin.example/b",
+			name:            "308 with a rewindable body is followed and replayed",
+			status:          http.StatusPermanentRedirect,
+			rewindableBody:  true,
+			wantGetBodyNil:  false,
+			wantHopURLs:     []string{"http://origin.example/a", "http://origin.example/b"},
+			wantHopMethods:  []string{http.MethodPost, http.MethodPost},
+			wantHopBodies:   []string{parityPayload, parityPayload},
+			wantStatus:      http.StatusOK,
+			wantData:        "final",
+			wantLocation:    "",
+			wantChainLen:    2,
+			wantStatusCodes: []int{http.StatusPermanentRedirect, http.StatusOK},
+			wantLastURL:     "http://origin.example/b",
 		},
 		{
 			// The 302 control rewrites to GET and drops the body, so no rewind is
-			// required.
-			name:              "302 built the way the runner builds it is followed because the body is dropped",
-			status:            http.StatusFound,
-			runnerConstructed: true,
-			wantGetBodyNil:    true,
-			wantHopURLs:       []string{"http://origin.example/a", "http://origin.example/b"},
-			wantHopMethods:    []string{http.MethodPost, http.MethodGet},
-			wantHopBodies:     []string{parityPayload, ""},
-			wantStatus:        http.StatusOK,
-			wantData:          "final",
-			wantLocation:      "",
-			wantChainLen:      2,
-			wantStatusCodes:   []int{http.StatusFound, http.StatusOK},
-			wantLastURL:       "http://origin.example/b",
+			// required and the nil GetBody is irrelevant. This is what scopes the rule
+			// above to the body-preserving statuses.
+			name:            "302 with a non-rewindable body is followed because the body is dropped",
+			status:          http.StatusFound,
+			rewindableBody:  false,
+			wantGetBodyNil:  true,
+			wantHopURLs:     []string{"http://origin.example/a", "http://origin.example/b"},
+			wantHopMethods:  []string{http.MethodPost, http.MethodGet},
+			wantHopBodies:   []string{parityPayload, ""},
+			wantStatus:      http.StatusOK,
+			wantData:        "final",
+			wantLocation:    "",
+			wantChainLen:    2,
+			wantStatusCodes: []int{http.StatusFound, http.StatusOK},
+			wantLastURL:     "http://origin.example/b",
 		},
 	}
 
@@ -1255,24 +1285,23 @@ func TestRedirectRunnerConstructedBodyIsNotReplayedOn307308(t *testing.T) {
 				options.FollowRedirects = true
 				options.MaxRedirects = 10
 			}, rt)
-			t.Cleanup(ht.Dialer.Close)
 
 			var req *retryablehttp.Request
 			var err error
-			if tc.runnerConstructed {
-				// runner/runner.go:1882 - the client's own constructor, nil body.
-				req, err = ht.NewRequestWithContext(context.Background(), http.MethodPost, "http://origin.example/a")
-				require.NoError(t, err)
-				// runner/runner.go:1911-1918 - the payload attached by direct field
-				// assignment, verbatim, including the declared length the comment
-				// there relies on.
-				req.ContentLength = int64(len(parityPayload))
-				req.Body = io.NopCloser(strings.NewReader(parityPayload))
-			} else {
+			if tc.rewindableBody {
 				// The buffered path: retryablehttp wraps the reader in a reusable
 				// reader and installs GetBody alongside it.
 				req, err = retryablehttp.NewRequest(http.MethodPost, "http://origin.example/a", strings.NewReader(parityPayload))
 				require.NoError(t, err)
+			} else {
+				// The non-rewindable path: build a body-less request, then attach the
+				// payload by direct field assignment. That sets Body and declares
+				// ContentLength but never populates GetBody, which is the combination
+				// net/http refuses to replay.
+				req, err = ht.NewRequestWithContext(context.Background(), http.MethodPost, "http://origin.example/a")
+				require.NoError(t, err)
+				req.ContentLength = int64(len(parityPayload))
+				req.Body = io.NopCloser(strings.NewReader(parityPayload))
 			}
 
 			// Both construction paths declare the same content length; GetBody is the
@@ -1281,6 +1310,8 @@ func TestRedirectRunnerConstructedBodyIsNotReplayedOn307308(t *testing.T) {
 				"whether GetBody is populated is the single field net/http consults at client.go:531")
 			require.Equal(t, int64(7), req.ContentLength,
 				"both construction paths declare the same 7-byte length, so the length cannot explain the difference")
+			require.NotNil(t, req.Body,
+				"both construction paths must actually carry the payload, otherwise outgoingLength() would be 0 and the rule would never be reached")
 
 			resp, err := ht.Do(req, UnsafeOptions{})
 			require.NoError(t, err,
@@ -1318,7 +1349,7 @@ func TestRedirectRunnerConstructedBodyIsNotReplayedOn307308(t *testing.T) {
 				"HasChain is len(Chain) > 1, so a refused redirect reports no chain at all")
 			require.Equal(t, tc.wantStatusCodes, resp.GetChainStatusCodes())
 			require.Equal(t, tc.wantLastURL, resp.GetChainLastURL(),
-				"the operator-visible final URL is empty for a refused redirect, which is how the defect reaches output")
+				"the operator-visible final URL is empty for an unfollowed redirect, because a one-item chain has no last hop to report")
 		})
 	}
 }

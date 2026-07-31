@@ -35,7 +35,7 @@ const (
 )
 
 // chainMaxRedirects exceeds the fixture's two redirects, so the guard at
-// common/httpx/httpx.go:103 cannot terminate these chains; redirect-budget behavior is
+// common/httpx/httpx.go:104 cannot terminate these chains; redirect-budget behavior is
 // covered in redirect_test.go.
 const chainMaxRedirects = 10
 
@@ -86,9 +86,6 @@ func newChainFixture(t *testing.T) (*Response, *mockTransport) {
 		options.FollowRedirects = true
 		options.MaxRedirects = chainMaxRedirects
 	}, mt)
-	// Close the disk-backed fastdialer state created by New; the mock transport
-	// bypasses it but does not disable its resources.
-	t.Cleanup(ht.Dialer.Close)
 
 	req, err := retryablehttp.NewRequest(http.MethodGet, chainTargetA, nil)
 	require.NoError(t, err, "the fixture target must parse, otherwise no hop ever reaches the chain builder")
@@ -121,7 +118,6 @@ func newTwoHopChainFixture(t *testing.T) (*Response, *mockTransport) {
 		options.FollowRedirects = true
 		options.MaxRedirects = chainMaxRedirects
 	}, mt)
-	t.Cleanup(ht.Dialer.Close)
 
 	req, err := retryablehttp.NewRequest(http.MethodGet, chainTargetA, nil)
 	require.NoError(t, err, "the boundary fixture target must parse, otherwise no hop reaches the chain builder")
@@ -231,6 +227,10 @@ func TestChainAccessorsMultiHop(t *testing.T) {
 			[]string{boundaryHops[0].URL, boundaryHops[1].URL},
 			"the chain's RequestURL sequence must match the requests the transport really saw")
 	})
+
+	// The same accessor surface, driven with a credential-bearing target, where Location
+	// resolution decides whether the credential reaches caller-visible output.
+	t.Run("a credential in the target URL reaches the accessors when Location is relative", assertChainRetainsURLUserinfoInCallerVisibleOutput)
 }
 
 // TestChainGetChainOmitsFirstRequestAndLastResponse verifies GetChain's loop contract:
@@ -379,6 +379,10 @@ func TestChainDumpsCarryNoBody(t *testing.T) {
 		require.NotContains(t, dump, marker,
 			"the concatenated chain dump must stay body-free as well, including "+marker)
 	}
+
+	// The dumps carry no body, but they do carry every header verbatim - the other half
+	// of what the dump bytes contain.
+	t.Run("the dumps retain request and response headers verbatim", assertChainDumpsExposeSensitiveHeaders)
 }
 
 // TestChainRedirectHopsDumpProtoZero verifies that the original request dump carries
@@ -446,7 +450,6 @@ func TestChainSingleItemAccessors(t *testing.T) {
 		options.FollowRedirects = true
 		options.MaxRedirects = chainMaxRedirects
 	}, mt)
-	t.Cleanup(ht.Dialer.Close)
 
 	req, err := retryablehttp.NewRequest(http.MethodGet, chainSingleTarget, nil)
 	require.NoError(t, err, "the fixture target must parse, otherwise the accessors are never reached")
@@ -525,12 +528,15 @@ const (
 		chainSecretResponseHeader + ": " + chainSecretResponseValue + "\r\n\r\n"
 )
 
-// TestChainDumpsExposeSensitiveHeaders verifies that same-origin chain dumps retain
+// assertChainDumpsExposeSensitiveHeaders verifies that same-origin chain dumps retain
 // request credentials and response headers verbatim. GetChain is written by StoreChain,
 // while GetChainAsSlice populates JSON chain output; neither accessor redacts upstream
 // dump bytes. Same-origin routing isolates chain serialization from cross-origin header
 // stripping.
-func TestChainDumpsExposeSensitiveHeaders(t *testing.T) {
+//
+// It runs as a sub-test of TestChainDumpsCarryNoBody: both examine exactly what the dump
+// bytes do and do not contain, one for payload bytes and one for header values.
+func assertChainDumpsExposeSensitiveHeaders(t *testing.T) {
 	// Two hops on ONE origin. Same-origin is deliberate: it removes net/http's
 	// cross-origin stripping from the picture entirely, so what the dumps contain is
 	// attributable to the chain builder alone rather than to redirect header policy,
@@ -553,7 +559,6 @@ func TestChainDumpsExposeSensitiveHeaders(t *testing.T) {
 		options.FollowRedirects = true
 		options.MaxRedirects = chainMaxRedirects
 	}, mt)
-	t.Cleanup(ht.Dialer.Close)
 
 	req, err := retryablehttp.NewRequest(http.MethodGet, chainTargetA, nil)
 	require.NoError(t, err, "the fixture target must parse, otherwise no hop reaches the chain builder")
@@ -660,13 +665,17 @@ const (
 	chainPlainFinal    = "http://origin.example/final"
 )
 
-// TestChainRetainsURLUserinfoInCallerVisibleOutput compares relative and absolute
+// assertChainRetainsURLUserinfoInCallerVisibleOutput compares relative and absolute
 // redirect Locations for a target containing URL userinfo. A relative Location inherits
 // the base URL's userinfo, so the resolved Location, follow-up RequestURL, final URL, and
 // derived Basic header retain it; an absolute Location without userinfo does not. The
 // first chain item still records the original credential-bearing URL and request dump.
 // net/http strips userinfo from the synthesized Referer, providing a control.
-func TestChainRetainsURLUserinfoInCallerVisibleOutput(t *testing.T) {
+//
+// It runs as a sub-test of TestChainAccessorsMultiHop, which establishes what the
+// accessors report for a plain chain; this pins what they report when the target URL
+// carries a credential, which is the same accessor surface under a different input.
+func assertChainRetainsURLUserinfoInCallerVisibleOutput(t *testing.T) {
 	cases := []struct {
 		name string
 		// scriptedLocation is the ONLY difference between the two rows.
@@ -738,7 +747,6 @@ func TestChainRetainsURLUserinfoInCallerVisibleOutput(t *testing.T) {
 				options.FollowRedirects = true
 				options.MaxRedirects = chainMaxRedirects
 			}, mt)
-			t.Cleanup(ht.Dialer.Close)
 
 			req, err := retryablehttp.NewRequest(http.MethodGet, chainUserinfoStart, nil)
 			require.NoError(t, err, "a userinfo-bearing target must parse, otherwise the scenario never runs")

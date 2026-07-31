@@ -1,7 +1,6 @@
 package httpx
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,7 +33,10 @@ import (
 // removes the assertion power of the tests that depend on it:
 //
 //  1. Snapshot before delegating, with a cloned header, so downstream mutation of
-//     the live request cannot change an observation already recorded.
+//     the live request cannot change an observation already recorded, and take the
+//     body from the LIVE r.Body - consumed to EOF and closed, as the real transport
+//     does - never from r.GetBody, whose manufactured copy would report what a replay
+//     would carry instead of what this hop carried.
 //  2. A mock response must deliver the bytes it declares: declaring a length it does
 //     not deliver makes the response dump fail and Do return no response at all.
 //  3. Set the protocol fields and the Response.Request back-reference, which chain
@@ -43,11 +45,18 @@ import (
 //  4. Assert through the accessors. Response.Headers is a plain map[string][]string,
 //     so GetHeader is a raw, case-sensitive read: use canonical MIME spellings such
 //     as "Etag", never "ETag" or "etag".
-//  5. Never render a URL into a diagnostic without redacting it, because
-//     url.URL.String() serializes userinfo verbatim and a password would reach a
-//     returned error and a retained CI log (CWE-532). Consumers follow the same rule
-//     by asserting individual snapshot fields rather than formatting a whole
-//     recordedRequest, which testify would render with %#v anyway.
+//  5. Never render a URL, or any part of one, into a diagnostic without passing it
+//     through redactedRequestLine. url.URL.String() serializes userinfo verbatim, and
+//     url.URL.Redacted() masks only the password - a username, a capability token in
+//     the query, a fragment and a credential-bearing path segment all survive it and
+//     would reach a returned error and a retained CI log (CWE-532). The single
+//     formatter below therefore drops userinfo entirely and replaces the path, the
+//     query and the fragment with size-only markers - unconditionally, with no
+//     shape-based exemption, because "this path looks harmless" is not a property any
+//     whitelist can decide: a short alphanumeric segment is exactly what a capability
+//     token looks like. Consumers follow the same rule by asserting individual
+//     snapshot fields rather than formatting a whole recordedRequest, which testify
+//     would render with %#v anyway.
 //
 // The reach of invariant 5 stops at this file's own output, and the boundary is worth
 // stating exactly. MEASURED with a target of "http://alice:s3cr3tpw@origin.example/...":
@@ -59,9 +68,9 @@ import (
 //
 // A userinfo target is therefore legitimate only while its requests SUCCEED - which is
 // the case for the two tests that pin URL-credential disclosure deliberately,
-// TestChainRetainsURLUserinfoInCallerVisibleOutput in redirect_chain_test.go and
-// TestRedirectRefererCrossOriginConfidentiality in redirect_test.go. The moment such a
-// request fails, the wrapper's prefix puts the cleartext password in the test log
+// assertChainRetainsURLUserinfoInCallerVisibleOutput in redirect_chain_test.go and
+// assertRedirectRefererCrossOriginConfidentiality in redirect_test.go, both of which run
+// as sub-tests of their planned parents. The moment such a request fails, the wrapper's prefix puts the cleartext password in the test log
 // (CWE-532), and the failure a reader sees says nothing about why. That combination is
 // what requireNoUserinfoErrorLeaks reports, in a message that names only the redacted
 // request line: a credential that has to travel through a FAILING request belongs in a
@@ -101,22 +110,27 @@ type recordedRequest struct {
 	// Body holds the buffered request bytes, nil when the hop carried none - which is
 	// also the case after a 301, 302 or 303 rewrites the method and drops the body.
 	Body []byte
+	// ContentLength is the length the hop DECLARES, which is not readable from Header:
+	// net/http carries it in the request field and synthesizes the Content-Length header
+	// only when it serializes the request to the wire, which a round tripper intercepts
+	// before. Asserting request framing therefore has to read this field - looking for a
+	// "Content-Length" header key on a recorded hop always finds nothing.
+	//
+	// A value of 0 means an empty body and -1 means an unknown length, which is what a
+	// body streamed without a discoverable size would report.
+	ContentLength int64
 }
 
-// String renders the snapshot with any userinfo password redacted, so printing one
-// cannot copy a credential into a test log (CWE-532, see redactedRequestLine).
+// String renders the snapshot through the shared URL redactor, so printing one cannot
+// copy a credential into a test log (CWE-532, see redactedRequestLine).
 //
 // It reports header and body SIZES rather than values, because those are the fields
 // most likely to carry a credential of their own. It protects the fmt paths only:
 // testify renders unequal values with %#v, which bypasses any Stringer, so a
 // consumer asserting a header or a payload compares that field directly.
 func (rr recordedRequest) String() string {
-	redacted := rr.URL
-	if parsed, err := url.Parse(rr.URL); err == nil {
-		redacted = parsed.Redacted()
-	}
 	return fmt.Sprintf("%s %s (host %q, %d header keys, %d body bytes)",
-		rr.Method, redacted, rr.Host, len(rr.Header), len(rr.Body))
+		rr.Method, redactedURLString(rr.URL), rr.Host, len(rr.Header), len(rr.Body))
 }
 
 // clone returns an independent copy of the snapshot, so a consumer that mutates
@@ -132,21 +146,121 @@ func (rr recordedRequest) clone() recordedRequest {
 	return out
 }
 
-// redactedRequestLine renders "METHOD URL" for a diagnostic with any userinfo
-// password replaced by "xxxxx".
+// redactedRequestLine renders "METHOD URL" for a diagnostic with every part of the URL
+// that can carry a credential removed. It is the single formatter every diagnostic in
+// this file is built from, and none may format an *url.URL or a route key directly.
 //
-// Every diagnostic in this file is built from it and none may format an *url.URL
-// directly: url.URL.String() serializes userinfo verbatim, so a target such as
-// "http://alice:s3cr3t@origin.example/missing" would carry its password into a
-// returned error and a retained CI log (CWE-532). url.URL.Redacted() replaces only
-// the password, leaving everything a diagnostic needs readable, and is nil-receiver
-// safe.
+// url.URL.String() serializes userinfo verbatim, and url.URL.Redacted() is not enough
+// either: it masks only the password, so a target such as
+// "http://alice:s3cr3t@origin.example/reset/T0KEN?apikey=k1#frag" keeps its username,
+// its capability token, its fragment and its credential-bearing path segment, all of
+// which would reach a returned error and a retained CI log (CWE-532). The fixtures in
+// this package deliberately carry exactly those components.
 //
 // Redaction is confined to human-readable output: route matching still keys on
-// r.URL.Host and r.URL.Path, neither of which carries userinfo, and
-// recordedRequest.URL still holds the exact wire URL for byte-for-byte assertions.
+// r.URL.Host and r.URL.Path, and recordedRequest.URL still holds the exact wire URL, so
+// byte-for-byte assertions are unaffected.
 func redactedRequestLine(r *http.Request) string {
-	return r.Method + " " + r.URL.Redacted()
+	return r.Method + " " + redactedURL(r.URL)
+}
+
+// redactedURL renders u as "scheme://authority<redacted path>" with userinfo dropped
+// outright and the path, query and fragment each replaced by a size-only marker.
+//
+// The authority is the only component echoed, and it is safe to echo: url.URL keeps
+// credentials in User, so Host holds only host[:port] - which is also the part a reader
+// needs in order to tell one synthetic origin from another. Every marker states the byte
+// count of what it replaced, never the bytes themselves, matching the size-not-value rule
+// recordedRequest.String() already follows.
+//
+// The contract this file relies on, stated as the output for every URL shape a fixture
+// here can produce (this harness declares no Test function of its own, so the shapes are
+// recorded where the formatter is defined):
+//
+//	http://alice:s3cr3t@origin.example/reset/T0KEN?apikey=k1#frag
+//	  -> http://origin.example/<redacted 2 segments, 12 bytes>?<redacted 9 bytes>#<redacted 4 bytes>
+//	http://origin.example/a          -> http://origin.example/<redacted 1 segments, 2 bytes>
+//	http://origin.example/p%2Fq      -> http://origin.example/<redacted 1 segments, 6 bytes>
+//	http://origin.example/<74 chars>/second
+//	  -> http://origin.example/<redacted 2 segments, 82 bytes>
+//	http://origin.example/x?         -> http://origin.example/<redacted 1 segments, 2 bytes>?<redacted 0 bytes>
+//	http://origin.example            -> http://origin.example
+//
+// Read as a table it states the property that matters: userinfo never appears, and a
+// short alphanumeric segment, a percent escape, a query token, an empty query and a
+// fragment are all replaced rather than echoed - the length of the input changes only
+// the byte count in the marker, never whether redaction happens.
+func redactedURL(u *url.URL) string {
+	if u == nil {
+		return "<nil url>"
+	}
+	var b strings.Builder
+	if u.Scheme != "" {
+		b.WriteString(u.Scheme)
+		b.WriteString("://")
+	}
+	b.WriteString(u.Host)
+	b.WriteString(redactedPath(u.EscapedPath()))
+	if u.ForceQuery || u.RawQuery != "" {
+		fmt.Fprintf(&b, "?<redacted %d bytes>", len(u.RawQuery))
+	}
+	if u.Fragment != "" || u.RawFragment != "" {
+		fmt.Fprintf(&b, "#<redacted %d bytes>", len(u.Fragment))
+	}
+	return b.String()
+}
+
+// redactedURLString parses a recorded URL string and renders it through redactedURL.
+//
+// A snapshot stores its URL as a string, so a diagnostic built from one has to re-parse
+// it. An unparseable value is reported by size alone: it cannot be decomposed, so no
+// part of it can be shown to be credential-free.
+func redactedURLString(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Sprintf("<unparseable url, %d bytes>", len(rawURL))
+	}
+	return redactedURL(parsed)
+}
+
+// redactedPath replaces path CONTENT with a size-only marker, always, and reports only its
+// segment count and byte length.
+//
+// It has no exemption for short or "unreserved-looking" paths, because no character or
+// length test can establish that a path is credential-free: "/reset/T0KEN" is entirely
+// alphanumeric and only 12 bytes long, yet the segment is the secret. An earlier shape-based
+// whitelist echoed exactly that class of path verbatim into the unscripted-route diagnostic
+// and the test log, which is the CWE-532 exposure this now closes unconditionally.
+//
+// The metadata that remains is what keeps a failure attributable: two different rejected
+// routes with different shapes still produce different messages, so a table-driven failure
+// can be traced to its row without disclosing content. It is deliberately not a hash - a
+// digest of a low-entropy path is not meaningfully non-reversible - so it states metadata
+// only. A caller that needs to identify a route in a message uses the response authority or
+// a literal label of its own choosing, never this function's input.
+func redactedPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	return fmt.Sprintf("/<redacted %d segments, %d bytes>",
+		len(strings.Split(strings.Trim(path, "/"), "/")), len(path))
+}
+
+// redactedRouteKey renders one of the keys scriptedRedirects looked up, which is either
+// "host/path" or "/path", with the path part passed through redactedPath.
+//
+// The keys derive from r.URL.Host and r.URL.Path, so neither can carry userinfo, a query
+// or a fragment - but the path alone is enough to leak a credential-bearing segment,
+// which is why the key is sanitized rather than echoed verbatim. Note that r.URL.Path is
+// the DECODED path while redactedURL passes the escaped form, so a percent escape has
+// already been resolved by the time it reaches this function; that difference no longer
+// matters to the outcome, because path content is replaced by a size-only marker in either
+// representation.
+func redactedRouteKey(key string) string {
+	if slash := strings.Index(key, "/"); slash >= 0 {
+		return key[:slash] + redactedPath(key[slash:])
+	}
+	return key
 }
 
 // mockTransport records request snapshots and delegates replies to handler. Installed
@@ -223,26 +337,31 @@ func requireNoUserinfoErrorLeaks(t *testing.T, rt *mockTransport) {
 	})
 }
 
-// RoundTrip counts the call, snapshots the body and the cloned header, records the
-// isolated snapshot under the mutex, then invokes the handler.
+// RoundTrip counts the call, consumes the live request body, snapshots it with the cloned
+// header, records the isolated snapshot under the mutex, then invokes the handler.
 //
 // That ordering is load bearing. Counting first, ahead of every early return, is what
 // lets a test tell "the transport was never reached" from "the transport answered" -
 // the only way to prove the client deadline is one wall-clock budget for the whole
-// call rather than a per-attempt one. Recording before delegating keeps the per-hop
-// view honest. Releasing the mutex before the handler runs stops a sleeping handler
-// from blocking requests() for the length of its sleep.
+// call rather than a per-attempt one. Consuming and closing the body the client really
+// sent - never a copy manufactured from GetBody - is what makes the recorded bytes wire
+// evidence rather than a restatement of the caller's intent, and it is what the
+// http.RoundTripper contract requires of the transport this replaces (see
+// snapshotRequestBody). Recording before delegating keeps the per-hop view honest.
+// Releasing the mutex before the handler runs stops a sleeping handler from blocking
+// requests() for the length of its sleep.
 func (m *mockTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	m.calls.Add(1)
 
 	body, bodyErr := snapshotRequestBody(r)
 
 	snap := recordedRequest{
-		Method: r.Method,
-		URL:    r.URL.String(),
-		Host:   r.Host,
-		Header: r.Header.Clone(),
-		Body:   body,
+		Method:        r.Method,
+		URL:           r.URL.String(),
+		Host:          r.Host,
+		Header:        r.Header.Clone(),
+		Body:          body,
+		ContentLength: r.ContentLength,
 	}
 	m.mu.Lock()
 	m.recorded = append(m.recorded, snap)
@@ -318,44 +437,42 @@ func (m *mockTransport) userinfoErrorLeaks() []string {
 	return append([]string(nil), m.userinfoErrorTargets...)
 }
 
-// snapshotRequestBody returns the request's payload bytes while leaving the request
-// readable for the handler, for a retryablehttp retry and for a 307/308 replay.
+// snapshotRequestBody drains the LIVE request body to EOF and closes it, returning the
+// bytes this hop actually handed to the transport.
 //
-// It prefers r.GetBody, which retryablehttp and net/http both populate and which is
-// non-destructive on either path: retryablehttp's reusable reader rewinds itself at
-// io.EOF, and net/http returns an independent copy. Only when GetBody is absent does
-// it drain r.Body, and it then reinstalls an equivalent reader over the buffered
-// bytes. A read failure is returned rather than swallowed, because a body the harness
-// could not read is a body it cannot truthfully record.
+// Reading the live body is the whole point, and r.GetBody is deliberately NOT used as the
+// wire observation. GetBody manufactures a fresh reader over the buffered payload, so it
+// reports what a replay WOULD carry rather than what this hop carried: a redirected hop
+// whose live body had already been exhausted, or replaced with different bytes, would still
+// read back as correct through GetBody, which is exactly the defect the per-hop body
+// assertions exist to catch. Consumers assert that GetBody EXISTS separately, because that
+// is a distinct contract - it is the mechanism net/http replays a 307 with
+// (common/httpx/request_body_test.go:596-597, :654-655).
+//
+// Consuming and closing is also what the http.RoundTripper contract requires of any real
+// transport ("RoundTrip must always close the body, including on errors"), so this makes the
+// harness behave like the http.Transport it replaces.
+//
+// Nothing is reinstalled in r.Body afterwards, and that is deliberate too. retryablehttp
+// wraps every request payload in a rewindable reader whose Read resets it at io.EOF and
+// whose Close is a no-op (projectdiscovery/utils reader.ReusableReadCloser), which is the
+// property its retry loop documents and relies on; net/http builds a redirected hop from
+// ireq.GetBody(), which returns an independent rewindable reader. Substituting a one-shot
+// reader here would therefore be strictly less faithful than leaving the client's own body
+// in place. A read or close failure is returned rather than swallowed, because a body the
+// harness could not fully consume is a body it cannot truthfully record.
 func snapshotRequestBody(r *http.Request) ([]byte, error) {
 	if r.Body == nil || r.Body == http.NoBody {
 		return nil, nil
 	}
 
-	if r.GetBody != nil {
-		rc, err := r.GetBody()
-		if err != nil {
-			return nil, fmt.Errorf("obtaining a request body copy via GetBody: %w", err)
-		}
-		if rc != nil {
-			defer func() {
-				_ = rc.Close()
-			}()
-			buf, err := io.ReadAll(rc)
-			if err != nil {
-				return nil, fmt.Errorf("reading the request body copy: %w", err)
-			}
-			return buf, nil
-		}
-	}
-
 	buf, readErr := io.ReadAll(r.Body)
-	_ = r.Body.Close()
-	// Restore before reporting any error, so the handler still sees whatever was
-	// readable instead of a consumed body.
-	r.Body = io.NopCloser(bytes.NewReader(buf))
+	closeErr := r.Body.Close()
 	if readErr != nil {
-		return buf, fmt.Errorf("draining the request body: %w", readErr)
+		return buf, fmt.Errorf("draining the live request body: %w", readErr)
+	}
+	if closeErr != nil {
+		return buf, fmt.Errorf("closing the live request body: %w", closeErr)
 	}
 	return buf, nil
 }
@@ -474,11 +591,12 @@ func scriptedRedirects(t *testing.T, script map[string]mockHop) func(*http.Reque
 //
 // It is a separate function because that message goes to two places - the test log and
 // the returned error - and a single formatter is the only way to guarantee both stay
-// redacted (CWE-532). The tried keys are echoed verbatim: they derive from r.URL.Host
-// and r.URL.Path, neither of which can carry userinfo.
+// redacted (CWE-532). Both tried keys go through redactedRouteKey: they carry no
+// userinfo, query or fragment, but a path segment on its own is enough to disclose a
+// credential, so neither is echoed verbatim.
 func unscriptedRouteError(r *http.Request, triedQualified, triedPath string) error {
 	return fmt.Errorf("scriptedRedirects: no route scripted for %s (tried %q then %q)",
-		redactedRequestLine(r), triedQualified, triedPath)
+		redactedRequestLine(r), redactedRouteKey(triedQualified), redactedRouteKey(triedPath))
 }
 
 // errReadCloser is a response body whose every Read fails with a fixed error.
@@ -496,7 +614,7 @@ func unscriptedRouteError(r *http.Request, triedQualified, triedPath string) err
 //	resp.Body = &errReadCloser{err: gzip.ErrHeader}
 //	resp.ContentLength = -1 // a body that yields no byte cannot satisfy a declared length
 //
-// It is a distinct type from blockingReadCloser (common/httpx/httpx_test.go:126),
+// It is a distinct type from blockingReadCloser (common/httpx/httpx_test.go:127),
 // which blocks forever rather than failing, and that existing helper is left
 // untouched.
 type errReadCloser struct {
@@ -513,6 +631,69 @@ func (e *errReadCloser) Close() error {
 	return nil
 }
 
+// closeTrackingBody is a response body that records how many times it was closed and
+// how many bytes were read from it.
+//
+// It exists because the body handed back by the transport is the only handle on the
+// underlying connection, and Do replaces the Response.Body field several times over:
+// the read cap wraps it in a limited reader, the response dump swaps in an in-memory
+// reader, and a content-encoding retry abandons the whole response. None of those
+// replacements is observable from the outside, so a leaked closer can only be detected
+// by asking the body the transport actually returned whether it was ever closed.
+//
+// Reads and closes are counted atomically so a consumer may drive the client from a
+// helper goroutine, and Close is delegated to the wrapped reader when that reader is
+// itself a closer, keeping the wrapper faithful. Wrap it around a failing reader to
+// track the abandoned attempt of the content-encoding retry:
+//
+//	body := newCloseTrackingBody(&errReadCloser{err: gzip.ErrHeader})
+type closeTrackingBody struct {
+	reader io.Reader
+	closes atomic.Int64
+	reads  atomic.Int64
+}
+
+// newCloseTrackingBody wraps reader, which is required: a nil reader would report zero
+// bytes read on every path and silently void the assertions that depend on it.
+func newCloseTrackingBody(reader io.Reader) *closeTrackingBody {
+	if reader == nil {
+		panic("newCloseTrackingBody: a reader is required")
+	}
+	return &closeTrackingBody{reader: reader}
+}
+
+// Read delegates to the wrapped reader and accumulates the byte count, so a consumer can
+// assert how much of the body the client consumed as well as whether it released it.
+func (b *closeTrackingBody) Read(p []byte) (int, error) {
+	n, err := b.reader.Read(p)
+	b.reads.Add(int64(n))
+	return n, err
+}
+
+// Close counts the call and forwards it to the wrapped reader when that reader is a
+// closer. It never reports an error: this body models a connection being released, and a
+// synthetic close failure would test the caller's error handling rather than its
+// resource handling.
+func (b *closeTrackingBody) Close() error {
+	b.closes.Add(1)
+	if closer, ok := b.reader.(io.Closer); ok {
+		_ = closer.Close()
+	}
+	return nil
+}
+
+// closeCount reports how many times Close was called: 0 means the body was leaked, and
+// more than 1 means it was released more than once.
+func (b *closeTrackingBody) closeCount() int {
+	return int(b.closes.Load())
+}
+
+// bytesRead reports how many bytes the client consumed from this body, which is what the
+// response read cap is meant to bound.
+func (b *closeTrackingBody) bytesRead() int {
+	return int(b.reads.Load())
+}
+
 // mockClientTimeout is a fail-fast safety budget: a scripted transport answers
 // in-process, so a test that reaches this deadline is misconfigured. The timeout tests
 // shorten it through the option mutator.
@@ -527,7 +708,7 @@ const mockClientTimeout = 2 * time.Second
 // option a test sets, and no field it mutates afterwards, can be observed by any other
 // test. That matters most for the redirect-policy tests, where the CheckRedirect
 // closure New installs captures the *Options pointer it was built with
-// (common/httpx/httpx.go:76, :98-143) - a client shared between two tests would let one
+// (common/httpx/httpx.go:77, :99-144) - a client shared between two tests would let one
 // row's MaxRedirects describe another row's assertions.
 //
 // Running mut before construction is mandatory, not stylistic. New parses
@@ -573,7 +754,7 @@ func newMockHTTPX(t *testing.T, mut func(*Options), rt http.RoundTripper) *HTTPX
 // allocates, at the end of the test that constructed the client.
 //
 // New unconditionally sets fastdialerOpts.WithDialerHistory = true
-// (common/httpx/httpx.go:64), and fastdialer answers that by opening a LevelDB store
+// (common/httpx/httpx.go:65), and fastdialer answers that by opening a LevelDB store
 // under a fresh os.MkdirTemp("", "httpx") directory. Nothing reclaims it implicitly:
 // only (*fastdialer.Dialer).Close closes the store, and only that close triggers the
 // os.RemoveAll that deletes the directory. A test that constructs a client and returns
@@ -598,11 +779,13 @@ func registerDialerCleanup(t *testing.T, ht *HTTPX) {
 	t.Cleanup(ht.Dialer.Close)
 }
 
-// Compile-time proof of the two interface contracts this harness has to satisfy:
+// Compile-time proof of the three interface contracts this harness has to satisfy:
 // *mockTransport is installed wherever the client expects an http.RoundTripper, and
-// *errReadCloser is substituted for a response body. Asserting them at the definition
-// means a signature drift fails the build here rather than at every install site.
+// *errReadCloser and *closeTrackingBody are substituted for a response body. Asserting
+// them at the definition means a signature drift fails the build here rather than at
+// every install site.
 var (
 	_ http.RoundTripper = (*mockTransport)(nil)
 	_ io.ReadCloser     = (*errReadCloser)(nil)
+	_ io.ReadCloser     = (*closeTrackingBody)(nil)
 )

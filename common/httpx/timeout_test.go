@@ -142,9 +142,9 @@ func timeoutSlowTransport(t *testing.T) *mockTransport {
 //
 // Both values are set through the option mutator because newMockHTTPX runs it BEFORE
 // New, and New freezes Options.Timeout into two places - the *http.Client deadline
-// (common/httpx/httpx.go:183) and the retry layer's overall budget (:81), which
+// (common/httpx/httpx.go:184) and the retry layer's overall budget (:82), which
 // TestTimeoutIsHardDeadlineNotPerAttempt documents in full - as well as
-// Options.RetryMax into the retry options (:82). Assigning either field after
+// Options.RetryMax into the retry options (:83). Assigning either field after
 // construction would leave the client on the harness's default budget and every
 // elapsed envelope below would then pass for the wrong reason.
 //
@@ -163,7 +163,7 @@ func newTimeoutHTTPX(t *testing.T, timeout time.Duration, retryMax int) (*HTTPX,
 }
 
 // TestTimeoutClientTimeoutErrorIdentity pins the identity of the error produced when
-// the client's own wall-clock deadline (common/httpx/httpx.go:183) fires, on every axis
+// the client's own wall-clock deadline (common/httpx/httpx.go:184) fires, on every axis
 // a caller can inspect.
 //
 // Provenance, all measured against this code and cross-checked against the mechanism in
@@ -175,7 +175,7 @@ func newTimeoutHTTPX(t *testing.T, timeout time.Duration, retryMax int) (*HTTPX,
 // retryablehttp wraps THAT with fmt.Errorf("... giving up after %d attempts: %w", ...)
 // (retryablehttp-go/do.go), which is where the *fmt.wrapError at the outside comes
 // from. Do surfaces the failure as (nil, err) because it returns early whenever the
-// response is nil and the error is not (common/httpx/httpx.go:261-263).
+// response is nil and the error is not (common/httpx/httpx.go:262-264).
 func TestTimeoutClientTimeoutErrorIdentity(t *testing.T) {
 	ht, rt := newTimeoutHTTPX(t, timeoutBudget, 0)
 
@@ -187,7 +187,7 @@ func TestTimeoutClientTimeoutErrorIdentity(t *testing.T) {
 	elapsed := time.Since(start)
 
 	require.Error(t, err, "a transport that never answers must fail the call")
-	require.Nil(t, resp, "Do returns no response at all once the deadline fires (httpx.go:261-263)")
+	require.Nil(t, resp, "Do returns no response at all once the deadline fires (httpx.go:262-264)")
 
 	// AXIS 1 - concrete type. *fmt.wrapError is unexported, so a type assertion is
 	// impossible; the %T rendering is the only mechanism available and is still a
@@ -270,8 +270,8 @@ func TestTimeoutClientTimeoutErrorIdentity(t *testing.T) {
 //
 // Two budgets govern the call and both are fed from the same Options.Timeout, which is
 // why they expire together instead of nesting. One is the deadline on the *http.Client,
-// assigned inline at common/httpx/httpx.go:183 and then re-applied by the retry client's
-// own constructor from retryablehttpOptions.Timeout (:81) - identical in production
+// assigned inline at common/httpx/httpx.go:184 and then re-applied by the retry client's
+// own constructor from retryablehttpOptions.Timeout (:82) - identical in production
 // because both read Options.Timeout - and it is what cuts the single in-flight attempt
 // short. The other is the retry layer's overall context, created from that same
 // retryablehttpOptions.Timeout at the top of its Do. By the time the first attempt fails
@@ -425,7 +425,7 @@ func TestTimeoutContextCancellationIdentity(t *testing.T) {
 	elapsed := time.Since(start)
 
 	require.Error(t, err, "a cancelled request must fail the call")
-	require.Nil(t, resp, "Do returns no response at all once the request is cancelled (httpx.go:261-263)")
+	require.Nil(t, resp, "Do returns no response at all once the request is cancelled (httpx.go:262-264)")
 
 	// AXIS 1 - concrete type. *errors.errorString is what errors.New produces, and
 	// context.Canceled is exactly that: the error arrives unwrapped, in contrast to
@@ -494,7 +494,7 @@ func TestTimeoutContextCancellationIdentity(t *testing.T) {
 // codebase: the client exposes no async duplicate of its request API - Go's concurrency
 // model makes one unnecessary - but it does expose a context-free constructor beside a
 // context-bearing one, and a defect could plausibly affect one and not the other.
-// NewRequest (common/httpx/httpx.go:460-462) is pure delegation to
+// NewRequest (common/httpx/httpx.go:484-486) is pure delegation to
 // NewRequestWithContext with context.Background(), which takes the context FIRST, so
 // the two must be indistinguishable on the wire and in the error they produce.
 //

@@ -35,13 +35,13 @@ import (
 // Division of labour with the sibling files, so no assertion is duplicated:
 // common/httpx/redirect_test.go owns redirect POLICY - the five-status method-rewriting
 // sweep (TestRedirectMethodAndBodyRewriting) and the GetBody discriminator
-// (TestRedirectRunnerConstructedBodyIsNotReplayedOn307308). This file owns the
+// (TestRedirect307308ReplayRequiresRewindableBody). This file owns the
 // BODY-FRAMING consequence, and asserts it for the two representative status codes only:
 // one that preserves the method and must replay the payload, one that rewrites the method
 // and must drop it.
 //
 // No test here uses t.Parallel(): New sets the process-global GODEBUG variable on the
-// HTTP/1.1 path (common/httpx/httpx.go:157), which is unsafe to race, and the whole
+// HTTP/1.1 path (common/httpx/httpx.go:158), which is unsafe to race, and the whole
 // package is sequential by convention.
 
 const (
@@ -70,7 +70,7 @@ const (
 	requestBodyFinalBody    = "final"
 
 	// requestBodyMaxRedirects is comfortably above the one redirect these scenarios take,
-	// so the budget guard at common/httpx/httpx.go:103 is never what ends the chain; the
+	// so the budget guard at common/httpx/httpx.go:104 is never what ends the chain; the
 	// budget boundary itself is owned by TestRedirectMaxRedirectsBudget.
 	requestBodyMaxRedirects = 10
 )
@@ -310,7 +310,7 @@ func TestRequestBodyForwardedExactly(t *testing.T) {
 //
 // httpx's own scanning path cannot reach it: runner/runner.go:1912 and :1939 attach a body
 // only when scanopts.RequestBody != "", and HTTPX.NewRequestWithContext
-// (common/httpx/httpx.go:462-480) passes a nil body. A LIBRARY CALLER can reach it, and a
+// (common/httpx/httpx.go:489-507) passes a nil body. A LIBRARY CALLER can reach it, and a
 // silent framing change on this path is the same class of defect as an unwanted chunked body
 // anywhere else - some origins and WAFs reject chunked requests - so it is asserted rather
 // than merely described.
@@ -582,7 +582,7 @@ func runRequestBodyRedirect(t *testing.T, firstHopStatus int) (*Response, []reco
 	})
 
 	// Redirect mode must be set BEFORE construction: New freezes the option values into the
-	// CheckRedirect closure it builds (common/httpx/httpx.go:97-114), so newMockHTTPX runs
+	// CheckRedirect closure it builds (common/httpx/httpx.go:98-115), so newMockHTTPX runs
 	// this mutator before New. It also installs the transport on both HTTP clients, which is
 	// what guarantees no path escapes to the network.
 	ht := newMockHTTPX(t, func(options *Options) {

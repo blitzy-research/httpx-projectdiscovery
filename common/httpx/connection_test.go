@@ -13,8 +13,8 @@ import (
 // Connection policy and the per-request connection lifecycle.
 //
 // New configures its HTTP/1.1 transport with DisableKeepAlives: true and
-// MaxIdleConnsPerHost: -1 (the transport literal at common/httpx/httpx.go:144-153, those
-// two fields at :152 and :147). That is a deliberate, scanner-specific choice rather than
+// MaxIdleConnsPerHost: -1 (the transport literal at common/httpx/httpx.go:145-154, those
+// two fields at :153 and :148). That is a deliberate, scanner-specific choice rather than
 // an accident of defaults - net/http's own default is to reuse connections. Every probe
 // therefore gets its own connection, so a target cannot correlate probes across one
 // socket, per-connection server state cannot leak from one probe into the next, and
@@ -51,7 +51,7 @@ import (
 // one family opens a hole.
 //
 // No test here opts into parallel execution. No test in the package does - New sets the
-// process-global GODEBUG variable on its HTTP/1.1 path (httpx.go:157), which is unsafe to
+// process-global GODEBUG variable on its HTTP/1.1 path (httpx.go:158), which is unsafe to
 // race - and these tests additionally count connections against a shared loopback
 // listener, which running them in parallel would make meaningless. For the same reason
 // every request is issued SEQUENTIALLY: concurrent requests need separate connections even
@@ -176,14 +176,14 @@ func newConnectionObserverServer(t *testing.T, rec *connectionRecorder, body str
 // production configuration.
 //
 // MEASURED against the code as it stands, and confirmed field by field against the
-// transport literal at common/httpx/httpx.go:144-153:
+// transport literal at common/httpx/httpx.go:145-154:
 //
-//	DisableKeepAlives   true   (:152)
-//	MaxIdleConnsPerHost -1     (:147)
+//	DisableKeepAlives   true   (:153)
+//	MaxIdleConnsPerHost -1     (:148)
 //	MaxIdleConns        0      - never set by the literal, so the zero value
 //	ForceAttemptHTTP2   false  - never set by the literal, so the zero value
-//	TLSClientConfig     InsecureSkipVerify true (:149), MinVersion TLS 1.0 (:150)
-//	TLSNextProto        nil    - only the HTTP/1.1-forced branch at :158 assigns it
+//	TLSClientConfig     InsecureSkipVerify true (:150), MinVersion TLS 1.0 (:151)
+//	TLSNextProto        nil    - only the HTTP/1.1-forced branch at :159 assigns it
 func TestTransportDisablesConnectionReuse(t *testing.T) {
 	ht := newLocalHTTPX(t)
 	// newLocalHTTPX does not release the disk-backed fastdialer history New allocates, so
@@ -198,9 +198,9 @@ func TestTransportDisablesConnectionReuse(t *testing.T) {
 
 	// The two fields that decide connection reuse.
 	require.True(t, tr.DisableKeepAlives,
-		"keep-alives must stay disabled (httpx.go:152): with reuse enabled several probes share one connection, so a target can correlate them, per-connection server state leaks from one probe into the next, and per-connection rate limiting sees one connection instead of one per request")
+		"keep-alives must stay disabled (httpx.go:153): with reuse enabled several probes share one connection, so a target can correlate them, per-connection server state leaks from one probe into the next, and per-connection rate limiting sees one connection instead of one per request")
 	require.Equal(t, -1, tr.MaxIdleConnsPerHost,
-		"MaxIdleConnsPerHost must stay -1 (httpx.go:147): a negative limit stops net/http caching an idle connection at all, which is the second and independent guard against reuse - MEASURED, it is what keeps peer addresses distinct even when DisableKeepAlives is flipped, so this field read is the only assertion in the suite that catches a change to it")
+		"MaxIdleConnsPerHost must stay -1 (httpx.go:148): a negative limit stops net/http caching an idle connection at all, which is the second and independent guard against reuse - MEASURED, it is what keeps peer addresses distinct even when DisableKeepAlives is flipped, so this field read is the only assertion in the suite that catches a change to it")
 
 	// Two fields the literal deliberately leaves at their zero value.
 	require.Equal(t, 0, tr.MaxIdleConns,
@@ -209,15 +209,15 @@ func TestTransportDisablesConnectionReuse(t *testing.T) {
 		"ForceAttemptHTTP2 must keep its zero value - it never appears in the transport literal: because that literal sets a custom DialTLSContext and TLSClientConfig, net/http will not negotiate HTTP/2 over TLS unless this field is true, so its zero value is what keeps this client on HTTP/1.1 while the separate HTTP/2 client handles h2")
 
 	// The TLS posture the same literal establishes.
-	require.NotNil(t, tr.TLSClientConfig, "the transport literal sets a TLS config (httpx.go:148-151)")
+	require.NotNil(t, tr.TLSClientConfig, "the transport literal sets a TLS config (httpx.go:149-152)")
 	require.True(t, tr.TLSClientConfig.InsecureSkipVerify,
-		"certificate verification must stay disabled (httpx.go:149): probing hosts that serve expired, self-signed or mismatched certificates is the point of the tool, and verifying would turn those targets into errors instead of results")
+		"certificate verification must stay disabled (httpx.go:150): probing hosts that serve expired, self-signed or mismatched certificates is the point of the tool, and verifying would turn those targets into errors instead of results")
 	require.Equal(t, uint16(tls.VersionTLS10), tr.TLSClientConfig.MinVersion,
-		"the negotiated floor must stay TLS 1.0 (httpx.go:150) so legacy endpoints remain reachable; raising it would silently drop those targets rather than report them")
+		"the negotiated floor must stay TLS 1.0 (httpx.go:151) so legacy endpoints remain reachable; raising it would silently drop those targets rather than report them")
 
 	// Proof that this client was built on the default protocol path.
 	require.Nil(t, tr.TLSNextProto,
-		"TLSNextProto must be nil on the default protocol path: only the HTTP/1.1-forced branch assigns it (httpx.go:158), and that branch also mutates the process-global GODEBUG variable (httpx.go:157) - a non-nil value here would mean this test observed a client built on that branch instead of the default one")
+		"TLSNextProto must be nil on the default protocol path: only the HTTP/1.1-forced branch assigns it (httpx.go:159), and that branch also mutates the process-global GODEBUG variable (httpx.go:158) - a non-nil value here would mean this test observed a client built on that branch instead of the default one")
 }
 
 // TestConnectionNotReusedAcrossRequests pins the observable consequence of that
@@ -306,8 +306,8 @@ func TestConnectionNotReusedAcrossRequests(t *testing.T) {
 //
 // This is the direct realization of the "state of a connection after close" assertion the
 // requirements name. Do wraps the body in a limiting reader and registers a deferred
-// io.Copy(io.Discard, ...) plus Close (common/httpx/httpx.go:281-289), and closes the body
-// explicitly at :321, so by the time Do returns the connection has already been drained
+// io.Copy(io.Discard, ...) plus Close (common/httpx/httpx.go:302-310), and closes the body
+// explicitly at :348, so by the time Do returns the connection has already been drained
 // and released and the caller closes nothing - *Response exposes no Close method at all.
 // What the caller is left with therefore has to be self-contained, and this test proves it
 // is by fetching a SECOND response and only then asserting on the first.
@@ -338,7 +338,7 @@ func TestConnectionStateAfterClose(t *testing.T) {
 	// whole point: the first response must still own its fully drained body once its
 	// connection has been closed and a second exchange has come and gone.
 	require.Equal(t, []byte(connectionStateBody), respA.Data,
-		"the first response must still hold its complete body after its connection was closed and a second request was served: Do drains and closes the body before returning (httpx.go:281-289, :321), so the bytes the caller keeps cannot depend on the connection still being open")
+		"the first response must still hold its complete body after its connection was closed and a second request was served: Do drains and closes the body before returning (httpx.go:302-310, :348), so the bytes the caller keeps cannot depend on the connection still being open")
 	require.Equal(t, len(connectionStateBody), respA.ContentLength,
 		"the first response must report the exact number of bytes delivered")
 	require.Equal(t, http.StatusOK, respA.StatusCode, "the first exchange completed with 200")

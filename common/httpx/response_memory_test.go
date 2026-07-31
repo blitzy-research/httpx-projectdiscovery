@@ -3,9 +3,11 @@ package httpx
 import (
 	"bytes"
 	"compress/gzip"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -233,6 +235,9 @@ func TestDoBodyReadCapTruncatesOversizeBody(t *testing.T) {
 			defer ts.Close()
 
 			ht := newLocalHTTPX(t)
+			// One client per row means one disk-backed dialer history per row, so
+			// register its release immediately after construction.
+			registerDialerCleanup(t, ht)
 			ht.Options.MaxResponseBodySizeToRead = tc.readCap
 
 			// doLocal's no-error assertion requires capped responses to remain usable.
@@ -292,6 +297,7 @@ func TestDoBodyReadCapChunkedTruncation(t *testing.T) {
 	defer ts.Close()
 
 	ht := newLocalHTTPX(t)
+	registerDialerCleanup(t, ht)
 	ht.Options.MaxResponseBodySizeToRead = 100
 
 	resp := doLocal(t, ht, ts.URL)
@@ -340,7 +346,9 @@ func TestDoBodyNotModifiedSkipsBodyRead(t *testing.T) {
 		}))
 		defer ts.Close()
 
-		resp := doLocal(t, newLocalHTTPX(t), ts.URL)
+		ht := newLocalHTTPX(t)
+		registerDialerCleanup(t, ht)
+		resp := doLocal(t, ht, ts.URL)
 
 		require.Equal(t, http.StatusNotModified, resp.StatusCode)
 		require.Empty(t, resp.Data, "a 304 body is never read")
@@ -493,5 +501,201 @@ func TestDoBodyGzipInvalidHeaderRetriesWithIdentity(t *testing.T) {
 		require.Equal(t, []string{"gzip", "identity"},
 			[]string{hops[0].Header.Get("Accept-Encoding"), hops[1].Header.Get("Accept-Encoding")},
 			"the single retry still negotiates identity before giving up")
+	})
+}
+
+// TestDoReleasesTransportBodyOnEveryPath asserts that the body the transport handed back
+// is closed exactly once on every path through Do, which is the state of the connection
+// after the call returns.
+//
+// The body is the only handle on the underlying connection, and Do replaces the
+// Response.Body field repeatedly: the read cap wraps it in io.NopCloser(io.LimitReader(...)),
+// which discards the original closer outright, and the response dump then swaps in an
+// in-memory reader, so the explicit close near the end of Do can no longer reach the
+// connection. Three paths never read the body to completion at all - a capped body, a
+// body-skip status, and a content-encoding retry that abandons the response mid-flight -
+// so nothing else releases it either. Without the release Do performs on the handle it
+// keeps, every one of the sub-tests below observes zero closes, and a scan leaves one
+// unreleased connection per response.
+//
+// Each sub-test also asserts the caller-visible outcome, so a regression that released
+// the body by consuming the whole response - defeating the read cap - would fail here
+// too.
+func TestDoReleasesTransportBodyOnEveryPath(t *testing.T) {
+	const origin = "http://origin.example/release"
+
+	// trackedTransport answers with the caller's response after substituting a
+	// close-tracking body, and returns both so the test can assert reads, closes and the
+	// per-hop request stream together. Bodies are returned in the order they were served.
+	trackedTransport := func(t *testing.T, reply func(*http.Request, int) (*http.Response, io.Reader)) (*mockTransport, func() []*closeTrackingBody) {
+		t.Helper()
+
+		var (
+			mu     sync.Mutex
+			served []*closeTrackingBody
+		)
+		rt := newMockTransport(t, func(r *http.Request) (*http.Response, error) {
+			mu.Lock()
+			attempt := len(served)
+			mu.Unlock()
+
+			resp, reader := reply(r, attempt)
+			tracked := newCloseTrackingBody(reader)
+			resp.Body = tracked
+
+			mu.Lock()
+			served = append(served, tracked)
+			mu.Unlock()
+			return resp, nil
+		})
+		return rt, func() []*closeTrackingBody {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]*closeTrackingBody(nil), served...)
+		}
+	}
+
+	t.Run("declared length above the read cap", func(t *testing.T) {
+		const body = "0123456789abcdefghij" // 20 bytes declared, 10 of them read
+		rt, bodies := trackedTransport(t, func(r *http.Request, _ int) (*http.Response, io.Reader) {
+			resp := mockResponse(r, http.StatusOK, http.Header{"Content-Type": {"text/plain"}}, body)
+			// The declared length stays at 20 while the cap stops the read at 10, which
+			// is the case the read cap has to survive without failing the request.
+			return resp, strings.NewReader(body)
+		})
+
+		ht := newMockHTTPX(t, func(options *Options) {
+			options.MaxResponseBodySizeToRead = 10
+		}, rt)
+		req, err := retryablehttp.NewRequest(http.MethodGet, origin, nil)
+		require.NoError(t, err)
+
+		resp, err := ht.Do(req, UnsafeOptions{})
+		require.NoError(t, err)
+		require.Equal(t, []byte(body[:10]), resp.Data, "the cap must retain exactly the first 10 bytes")
+
+		served := bodies()
+		require.Len(t, served, 1, "one response was served, so one body was acquired")
+		require.Equal(t, 1, served[0].closeCount(),
+			"the capped body must be released exactly once: the limited wrapper drops the original closer, so only the handle Do keeps can free the connection")
+		require.LessOrEqual(t, served[0].bytesRead(), 20,
+			"releasing the body must not turn into draining it: the cap exists to bound what is read")
+	})
+
+	t.Run("unknown length above the read cap", func(t *testing.T) {
+		body := strings.Repeat("z", 4096)
+		rt, bodies := trackedTransport(t, func(r *http.Request, _ int) (*http.Response, io.Reader) {
+			resp := mockResponse(r, http.StatusOK, http.Header{"Content-Type": {"text/plain"}}, body)
+			// -1 is what net/http reports for a chunked response, so this row covers the
+			// framing the declared-length guard cannot see.
+			resp.ContentLength = -1
+			return resp, strings.NewReader(body)
+		})
+
+		ht := newMockHTTPX(t, func(options *Options) {
+			options.MaxResponseBodySizeToRead = 64
+		}, rt)
+		req, err := retryablehttp.NewRequest(http.MethodGet, origin, nil)
+		require.NoError(t, err)
+
+		resp, err := ht.Do(req, UnsafeOptions{})
+		require.NoError(t, err)
+		require.Len(t, resp.Data, 64, "an undeclared length is capped by the same limit")
+
+		served := bodies()
+		require.Len(t, served, 1)
+		require.Equal(t, 1, served[0].closeCount(),
+			"a close-delimited body that was never read to completion must still be released exactly once")
+	})
+
+	t.Run("body skip status", func(t *testing.T) {
+		// 101 and 304 both skip the body read, and they take different routes through the
+		// response dump: the 1xx branch returns before touching the body at all.
+		for _, tc := range []struct {
+			name   string
+			status int
+		}{
+			{name: "switching protocols", status: http.StatusSwitchingProtocols},
+			{name: "not modified", status: http.StatusNotModified},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				const smuggled = "never-read"
+				rt, bodies := trackedTransport(t, func(r *http.Request, _ int) (*http.Response, io.Reader) {
+					resp := mockResponse(r, tc.status, http.Header{"Upgrade": {"websocket"}}, smuggled)
+					resp.ContentLength = -1 // the skipped read cannot satisfy a declared length
+					return resp, strings.NewReader(smuggled)
+				})
+
+				ht := newMockHTTPX(t, nil, rt)
+				req, err := retryablehttp.NewRequest(http.MethodGet, origin, nil)
+				require.NoError(t, err)
+
+				resp, err := ht.Do(req, UnsafeOptions{})
+				require.NoError(t, err)
+				require.Equal(t, tc.status, resp.StatusCode)
+				require.Empty(t, resp.Data, "the body read is skipped for this status")
+
+				served := bodies()
+				require.Len(t, served, 1)
+				require.Equal(t, 1, served[0].closeCount(),
+					"a skipped body read still has to release the connection: nothing drains or closes it on this path")
+			})
+		}
+	})
+
+	t.Run("content encoding retry", func(t *testing.T) {
+		const recovered = "plain-body"
+		rt, bodies := trackedTransport(t, func(r *http.Request, attempt int) (*http.Response, io.Reader) {
+			if r.Header.Get("Accept-Encoding") == "identity" {
+				return mockResponse(r, http.StatusOK, http.Header{"Content-Type": {"text/plain"}}, recovered),
+					strings.NewReader(recovered)
+			}
+			// A response labelled gzip whose body cannot be decoded: the dump fails, Do
+			// abandons this response and reissues the request with identity.
+			resp := mockResponse(r, http.StatusOK, http.Header{"Content-Encoding": {"gzip"}}, "")
+			resp.ContentLength = -1
+			return resp, &errReadCloser{err: gzip.ErrHeader}
+		})
+
+		ht := newMockHTTPX(t, nil, rt)
+		req, err := retryablehttp.NewRequest(http.MethodGet, origin, nil)
+		require.NoError(t, err)
+		req.Header.Set("Accept-Encoding", "gzip")
+
+		resp, err := ht.Do(req, UnsafeOptions{})
+		require.NoError(t, err)
+		require.Equal(t, []byte(recovered), resp.Data, "the identity attempt supplies the caller's body")
+
+		served := bodies()
+		require.Len(t, served, 2, "the retry acquires a second body, so both must be accounted for")
+		require.Equal(t, 1, served[0].closeCount(),
+			"the abandoned gzip attempt must be released before the retry is issued, not left to the garbage collector")
+		require.Equal(t, 1, served[1].closeCount(),
+			"the surviving attempt must be released exactly once as well")
+	})
+
+	t.Run("content encoding retry exhausted", func(t *testing.T) {
+		rt, bodies := trackedTransport(t, func(r *http.Request, _ int) (*http.Response, io.Reader) {
+			resp := mockResponse(r, http.StatusOK, http.Header{"Content-Encoding": {"gzip"}}, "")
+			resp.ContentLength = -1
+			return resp, &errReadCloser{err: gzip.ErrHeader}
+		})
+
+		ht := newMockHTTPX(t, nil, rt)
+		req, err := retryablehttp.NewRequest(http.MethodGet, origin, nil)
+		require.NoError(t, err)
+		req.Header.Set("Accept-Encoding", "gzip")
+
+		resp, err := ht.Do(req, UnsafeOptions{})
+		require.ErrorContains(t, err, "gzip: invalid header",
+			"the second decode failure is surfaced instead of provoking a third request")
+		require.Nil(t, resp)
+
+		served := bodies()
+		require.Len(t, served, 2, "the one-shot retry acquires exactly two bodies")
+		require.Equal(t, 1, served[0].closeCount(),
+			"the first failed attempt must be released even though the call ends in an error")
+		require.Equal(t, 1, served[1].closeCount(),
+			"the second failed attempt must be released on the error return path too")
 	})
 }
