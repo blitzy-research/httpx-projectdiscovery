@@ -49,6 +49,34 @@ import (
 //     by asserting individual snapshot fields rather than formatting a whole
 //     recordedRequest, which testify would render with %#v anyway.
 //
+// The reach of invariant 5 stops at this file's own output, and the boundary is worth
+// stating exactly. MEASURED with a target of "http://alice:s3cr3tpw@origin.example/...":
+// this harness renders "alice:xxxxx@" and net/http renders "alice:***@", but
+// retryablehttp-go prefixes the error it returns from Do with the caller's request URL
+// VERBATIM, so the final message reads "GET http://alice:s3cr3tpw@origin.example/...
+// giving up after 1 attempts: ...". That prefix is built from the *retryablehttp.Request
+// the consumer constructed, which no round tripper can influence.
+//
+// A userinfo target is therefore legitimate only while its requests SUCCEED - which is
+// the case for the two tests that pin URL-credential disclosure deliberately,
+// TestChainRetainsURLUserinfoInCallerVisibleOutput in redirect_chain_test.go and
+// TestRedirectRefererCrossOriginConfidentiality in redirect_test.go. The moment such a
+// request fails, the wrapper's prefix puts the cleartext password in the test log
+// (CWE-532), and the failure a reader sees says nothing about why. That combination is
+// what requireNoUserinfoErrorLeaks reports, in a message that names only the redacted
+// request line: a credential that has to travel through a FAILING request belongs in a
+// header instead, which is what common/httpx/cookie_auth_test.go does.
+//
+// One local network syscall survives interception, and it is not a leak in this harness.
+// New builds its CDN client through projectdiscovery/cdncheck, which probes IPv6
+// availability once by opening a UDP socket towards a well-known resolver address; the
+// probe transmits nothing, fails locally when the sandbox has no IPv6 route, and happens
+// even with CdnCheck disabled, so it is a capability check rather than a request. Every
+// HTTP request still goes through the round tripper installed by newMockHTTPX: a network
+// syscall trace of a run of these tests shows zero TCP connects, zero transmitted
+// packets and no DNS lookup for origin.example or other.example, and the same tests pass
+// with networking removed entirely.
+//
 // No helper uses t.Parallel() and consumers must not add it: New sets the
 // process-global GODEBUG environment variable on the HTTP/1.1 path, which is unsafe
 // to race.
@@ -128,6 +156,15 @@ type mockTransport struct {
 	mu       sync.Mutex
 	recorded []recordedRequest
 
+	// userinfoErrorTargets holds the redacted request line of every FAILED round trip
+	// whose URL embedded userinfo, guarded by the same mutex as recorded. That pairing
+	// is the one that defeats the redaction boundary described at the top of this file:
+	// the harness redacts its own message, but retryablehttp-go's wrapper echoes the raw
+	// URL of any request that ends in an error. Reporting is deferred to the cleanup
+	// registered by newMockTransport rather than raised here, because RoundTrip may run
+	// on a helper goroutine where a log call racing test completion would panic.
+	userinfoErrorTargets []string
+
 	// calls counts every entry into RoundTrip, including entries that return an
 	// error without producing a response. It is incremented at the very top of
 	// RoundTrip so a consumer can tell "the transport was reached and failed" apart
@@ -143,10 +180,47 @@ type mockTransport struct {
 // newMockTransport returns a recording round tripper that answers every request with
 // handler, which is required: asserting it here turns a forgotten script into a named
 // failure instead of an obscure error raised from inside net/http.
+//
+// It also registers the credential-leak check described in invariant 5 as a cleanup, so
+// every consumer is covered without any of them opting in.
 func newMockTransport(t *testing.T, handler func(*http.Request) (*http.Response, error)) *mockTransport {
 	t.Helper()
 	require.NotNil(t, handler, "newMockTransport: a handler is required")
-	return &mockTransport{handler: handler}
+	rt := &mockTransport{handler: handler}
+	requireNoUserinfoErrorLeaks(t, rt)
+	return rt
+}
+
+// requireNoUserinfoErrorLeaks fails the test, after it finishes, if a request whose URL
+// carried userinfo ended in an error at the transport - the one combination that puts a
+// cleartext password in the test log.
+//
+// It deliberately does NOT object to a userinfo target on its own: two tests in this
+// package exist to pin what the client does with URL credentials, and their requests
+// succeed, so nothing renders the raw URL. Restricting the check to the failing case is
+// what lets those pins stand while still catching the leak.
+//
+// It runs as a cleanup rather than inside RoundTrip on purpose. RoundTrip may execute on
+// a helper goroutine - the timeout tests drive the client from one - and a t.Error there
+// can race the end of the test, which panics with "Log in goroutine after test has
+// completed". A cleanup runs on the test's own goroutine, strictly after the test body
+// and strictly before the test is reported, so the failure is attributed correctly and
+// cannot race.
+//
+// The message names only the redacted request line, so reporting the leak cannot itself
+// print the password it exists to protect.
+func requireNoUserinfoErrorLeaks(t *testing.T, rt *mockTransport) {
+	t.Helper()
+	require.NotNil(t, rt, "requireNoUserinfoErrorLeaks: a transport is required")
+	t.Cleanup(func() {
+		if offenders := rt.userinfoErrorLeaks(); len(offenders) > 0 {
+			t.Errorf("mockTransport: %d failed request(s) carried userinfo in the target URL: %v - "+
+				"retryablehttp-go prefixes the error it returns from Do with the RAW request URL, so this test's log now holds "+
+				"the cleartext password however carefully this harness redacts its own messages (CWE-532); carry the credential "+
+				"in a header, or keep the userinfo target on a request that succeeds",
+				len(offenders), offenders)
+		}
+	})
 }
 
 // RoundTrip counts the call, snapshots the body and the cloned header, records the
@@ -177,13 +251,35 @@ func (m *mockTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if bodyErr != nil {
 		// An unreadable body breaks the "record exactly what was sent" contract, so
 		// the round trip fails loudly rather than reporting a body it never read.
+		m.noteUserinfoErrorLeak(r)
 		return nil, fmt.Errorf("mockTransport: %s: %w", redactedRequestLine(r), bodyErr)
 	}
 
 	if m.handler == nil {
+		m.noteUserinfoErrorLeak(r)
 		return nil, fmt.Errorf("mockTransport: no handler configured for %s", redactedRequestLine(r))
 	}
-	return m.handler(r)
+
+	resp, err := m.handler(r)
+	if err != nil {
+		m.noteUserinfoErrorLeak(r)
+	}
+	return resp, err
+}
+
+// noteUserinfoErrorLeak records that a request carrying URL userinfo ended in an error,
+// which is the combination requireNoUserinfoErrorLeaks reports. Only the redacted request
+// line is retained, and a request without userinfo is ignored, so the common path costs
+// one nil comparison.
+func (m *mockTransport) noteUserinfoErrorLeak(r *http.Request) {
+	if r.URL == nil || r.URL.User == nil {
+		return
+	}
+	line := redactedRequestLine(r)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.userinfoErrorTargets = append(m.userinfoErrorTargets, line)
 }
 
 // requests returns the per-hop snapshots recorded so far, oldest first.
@@ -207,6 +303,19 @@ func (m *mockTransport) requests() []recordedRequest {
 // retry layer counted.
 func (m *mockTransport) callCount() int {
 	return int(m.calls.Load())
+}
+
+// userinfoErrorLeaks returns the redacted request lines of the failed round trips whose
+// target embedded userinfo, oldest first. The slice is copied so the caller cannot mutate
+// the recording, matching requests().
+func (m *mockTransport) userinfoErrorLeaks() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(m.userinfoErrorTargets) == 0 {
+		return nil
+	}
+	return append([]string(nil), m.userinfoErrorTargets...)
 }
 
 // snapshotRequestBody returns the request's payload bytes while leaving the request
