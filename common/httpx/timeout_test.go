@@ -39,14 +39,18 @@ const (
 	// transport, so nothing here can depend on name resolution or egress.
 	timeoutTarget = "http://slow.example/"
 
-	// timeoutBudget is the client wall-clock deadline under test: long enough that no
-	// assertion races it on a loaded machine, short enough to keep the file sub-second.
-	timeoutBudget = 300 * time.Millisecond
+	// timeoutBudget is the client wall-clock deadline under test. It has to stay well
+	// above the scheduling noise between the deadline firing and the elapsed measurement,
+	// and well below timeoutTransportSleep, so every case fails on the deadline rather
+	// than on the handler's safety valve. Every elapsed bound is expressed as a multiple
+	// of this value, so the envelopes scale with it rather than having to be retuned.
+	timeoutBudget = 100 * time.Millisecond
 
 	// timeoutCancelAfter is when the caller-driven cancellation fires, two orders of
 	// magnitude inside timeoutNoDeadline so a defect that let the client deadline end that
-	// call would blow the elapsed envelope rather than pass quietly.
-	timeoutCancelAfter = 200 * time.Millisecond
+	// call would blow the elapsed envelope rather than pass quietly. It also has to leave
+	// the call enough time to reach the transport, which the call-count assertion checks.
+	timeoutCancelAfter = 60 * time.Millisecond
 
 	// timeoutNoDeadline is the cancellation test's client timeout, deliberately far beyond
 	// anything that test tolerates so the client deadline cannot be the cause.

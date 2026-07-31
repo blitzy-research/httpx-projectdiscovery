@@ -294,4 +294,73 @@ func TestDoSwitchingProtocolsProtocolVisibleOutcome(t *testing.T) {
 		"proves the dump is the synthetic 1xx rendering, not a real HTTP status line")
 	require.NotContains(t, resp.Raw, "\r\n",
 		"the synthetic dump is LF-joined, unlike the CRLF framing of real wire format")
+
+	// The same outcome is pinned once more through switchingProtocolsRoundTripper (:137),
+	// whose body blocks forever instead of failing on first read. Driving both fixtures
+	// establishes the outcome as a property of Do's 101 handling rather than of either
+	// body: a compliant Do reads neither, so both must yield byte-equivalent results.
+	//
+	// The call runs on its own goroutine behind a deadline because blockingReadCloser
+	// (:127) parks in a Read that no client timeout can interrupt. If 101 were ever lost
+	// from the skip set, the assertions above would already fail with the named sentinel;
+	// this sub-test would otherwise stall until the package timeout, so the deadline
+	// converts that stall into a bounded, attributable failure.
+	t.Run("the blocking fixture yields the same protocol-visible outcome", func(t *testing.T) {
+		blockingOptions := DefaultOptions
+		blockingOptions.CdnCheck = "false"
+		blockingOptions.Timeout = 2 * time.Second
+		blockingOptions.RetryMax = 0
+
+		// A client of its own, so this sub-test cannot inherit transport state from the
+		// fail-fast run above.
+		htBlocking, err := New(&blockingOptions)
+		require.NoError(t, err)
+		registerDialerCleanup(t, htBlocking)
+
+		blockingRT := switchingProtocolsRoundTripper{}
+		htBlocking.client.HTTPClient.Transport = blockingRT
+		htBlocking.client.HTTPClient2.Transport = blockingRT
+
+		blockingReq, err := retryablehttp.NewRequest(http.MethodGet, "http://example.com", nil)
+		require.NoError(t, err)
+
+		type doOutcome struct {
+			resp *Response
+			err  error
+		}
+		outcome := make(chan doOutcome, 1)
+		go func() {
+			blockingResp, blockingErr := htBlocking.Do(blockingReq, UnsafeOptions{})
+			outcome <- doOutcome{resp: blockingResp, err: blockingErr}
+		}()
+
+		var got doOutcome
+		select {
+		case got = <-outcome:
+		case <-time.After(4 * time.Second):
+			t.Fatal("Do did not return for a 101 whose body blocks on read: the body of a protocol switch must never be read")
+		}
+
+		require.NoError(t, got.err)
+		require.Equal(t, http.StatusSwitchingProtocols, got.resp.StatusCode,
+			"the 101 must reach the caller verbatim regardless of what the body would do when read")
+		require.Empty(t, got.resp.Data, "no body may be read for a protocol switch")
+		require.Empty(t, got.resp.RawData, "no undecoded body may be retained for a protocol switch")
+		require.Equal(t, 0, got.resp.ContentLength,
+			"with no Content-Length header and no body the recomputation must leave the length at 0")
+		require.Equal(t, 0, got.resp.Words, "word count is derived from the body, which was never read")
+		require.Equal(t, 0, got.resp.Lines, "line count is derived from the body, which was never read")
+
+		require.Equal(t, "websocket", got.resp.GetHeader("Upgrade"),
+			"the negotiated protocol must survive to the caller")
+		require.Equal(t, "Upgrade", got.resp.GetHeader("Connection"),
+			"the hop-by-hop upgrade signal must survive to the caller")
+
+		// Lengths rather than strings: the synthetic 1xx dump renders headers in map
+		// iteration order, so only its size is deterministic across runs.
+		require.Equal(t, len(resp.Raw), len(got.resp.Raw),
+			"both fixtures must produce the identical 67-byte synthetic 1xx dump")
+		require.Equal(t, got.resp.RawHeaders, got.resp.Raw,
+			"the 1xx branch returns a single buffer for both, so Raw carries no body section")
+	})
 }

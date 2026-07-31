@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -241,4 +242,61 @@ func TestNewRequestContextVariantParity(t *testing.T) {
 	}, reqA.Header, "the context-free variant's complete header set, pinned literally")
 	require.Equal(t, reqB.Header, reqA.Header,
 		"both constructors must inject the identical default header set")
+
+	// Failure propagation belongs to the same delegation contract: NewRequest returns
+	// whatever NewRequestWithContext produced, so a construction failure must surface
+	// identically through both variants and must never be paired with a usable request.
+	// These two inputs reach the constructor's only error returns - URL parsing
+	// (common/httpx/httpx.go:467) and request construction (:472) - which no encoding
+	// case can trigger, and their distinct concrete types identify which step failed.
+	t.Run("both variants propagate construction failures identically", func(t *testing.T) {
+		failures := []struct {
+			name      string
+			method    string
+			target    string
+			wantType  string
+			wantError string
+		}{
+			{
+				// An unterminated IPv6 literal cannot be parsed, so urlutil.ParseURL
+				// fails before a request object exists. It reports through
+				// projectdiscovery/utils errkit, which renders the net/url cause
+				// alongside its own chain label; both are pinned as measured because the
+				// dependency version is fixed.
+				name:      "unparseable authority fails url parsing",
+				method:    http.MethodGet,
+				target:    "http://[::1",
+				wantType:  "*errkit.ErrorX",
+				wantError: `cause="missing ']' in host" chain="failed to parse url"`,
+			},
+			{
+				// A method carrying a space is not a valid token (RFC 9110 §9.1), so the
+				// URL parses cleanly and retryablehttp rejects the method instead. The
+				// plain error type is what distinguishes this return from the one above.
+				name:      "method with a space fails request construction",
+				method:    "BAD METHOD",
+				target:    "http://example.com/",
+				wantType:  "*errors.errorString",
+				wantError: `net/http: invalid method "BAD METHOD"`,
+			},
+		}
+
+		for _, fc := range failures {
+			t.Run(fc.name, func(t *testing.T) {
+				reqCtx, errCtx := h.NewRequestWithContext(context.Background(), fc.method, fc.target)
+				require.Nil(t, reqCtx, "no request may be handed back alongside an error")
+				require.EqualError(t, errCtx, fc.wantError,
+					"the context-bearing variant must report the exact construction failure")
+				require.Equal(t, fc.wantType, fmt.Sprintf("%T", errCtx),
+					"the concrete error type names which constructor step rejected the input")
+
+				reqFree, errFree := h.NewRequest(fc.method, fc.target)
+				require.Nil(t, reqFree, "the delegating variant must not return a request either")
+				require.EqualError(t, errFree, fc.wantError,
+					"the context-free variant must propagate the identical failure text")
+				require.Equal(t, fc.wantType, fmt.Sprintf("%T", errFree),
+					"delegation must forward the error untouched rather than rewrap it")
+			})
+		}
+	})
 }
