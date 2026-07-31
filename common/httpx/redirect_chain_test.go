@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"encoding/base64"
 	"net/http"
 	"strings"
 	"testing"
@@ -9,40 +10,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// This file pins the five redirect-chain accessors on Response, every one of which was
-// at 0.0% statement coverage before it existed: GetChainStatusCodes
-// (common/httpx/response.go:62), GetChain (:71), GetChainAsSlice (:85), HasChain (:99)
-// and GetChainLastURL (:104).
-//
-// They are not incidental helpers. The runner consumes all five on its production
-// output paths - runner/runner.go:2339-2343 computes the final URL, :2534-2539 emits the
-// chain status codes and the structured chain items, :2657 emits the Location field - so
-// a defect in GetChainLastURL corrupts the primary user-facing output of every
-// redirect-following scan while leaving the rest of the suite green. Asserting the exact
-// final URL after a redirect chain is therefore the single highest-value assertion here.
-//
-// Every expected value below was measured against the code as it stands and is
-// deterministic: the mocked responses carry no Date header (mockResponse sets none and
-// http.Response.Write synthesizes none) and the request dumps carry no User-Agent
-// (net/http adds one at transport write time, which is after the chain builder has
-// already dumped the request), so the byte-exact dump literals are stable. They were
-// confirmed byte-identical across repeated runs.
-//
-// Two divergences from what a reader would reasonably expect are PINNED here rather than
-// fixed, because the redirect chain is consumed as-is by the runner's output layer and
-// changing it would change every user's output:
-//
-//  1. GetChain omits the first request and the last response entirely
-//     (TestChainGetChainOmitsFirstRequestAndLastResponse).
-//  2. GetChain is the empty string for a single-item chain
-//     (TestChainSingleItemAccessors).
-//
-// All interception happens at the http.RoundTripper boundary through the shared harness
-// in common/httpx/mocktransport_test.go, so the synthetic authority origin.example is
-// never resolved and no test here opens a socket. Nothing in this file runs in parallel,
-// and nothing in it may be made to: New sets the process-global GODEBUG variable on the
-// HTTP/1.1 path, which is unsafe to race, so every test in package httpx runs
-// sequentially - see the same warning on the shared harness.
+// These tests cover the five Response chain accessors consumed by runner output.
+// Synthetic hosts are handled entirely by the shared RoundTripper, and tests remain
+// sequential because New mutates process-wide GODEBUG on the HTTP/1.1 path.
 
 // Fixture targets. origin.example is a synthetic authority that exists only inside the
 // scripted transport and is never resolved or dialled.
@@ -64,26 +34,16 @@ const (
 	chainSingleHopBody = "single hop body"
 )
 
-// chainMaxRedirects is well above the fixture's two hops, so the redirect budget guard
-// at common/httpx/httpx.go:104 can never be what terminates a chain in this file. The
-// budget itself is the subject of common/httpx/redirect_test.go, not of this file.
+// chainMaxRedirects exceeds the fixture's two redirects, so the guard at
+// common/httpx/httpx.go:103 cannot terminate these chains; redirect-budget behavior is
+// covered in redirect_test.go.
 const chainMaxRedirects = 10
 
-// Measured per-item dumps for the three-hop fixture, exactly as
-// pdhttputil.GetChain records them. They are asserted as byte-exact literals because
-// that is the strictest possible statement of what the chain contains, and because each
-// one encodes a separate protocol-visible fact:
-//
-//   - chainChainRequest0 carries HTTP/1.1, the protocol version net/http stamped onto
-//     the caller's own request.
-//   - chainChainRequest1 and chainChainRequest2 carry HTTP/0.0, because net/http builds
-//     a redirect follow-up with zero-valued protocol fields, and they carry the per-hop
-//     Referer.
-//   - chainChainResponse0 and chainChainResponse1 carry the RELATIVE Location bytes the
-//     origin actually sent, which is what makes the absolute Location values in
-//     GetChainAsSlice provably the product of resolution rather than a copy.
-//   - every dump ends at the blank line that terminates the header block, because the
-//     builder dumps headers only.
+// Expected header-only dumps for the three-hop fixture. The initial request carries
+// HTTP/1.1; redirect-generated requests carry zero protocol fields and dump as HTTP/0.0.
+// Response dumps preserve relative Location header bytes, while GetChainAsSlice exposes
+// resolved Locations. Each dump ends at the header terminator because the upstream
+// builder excludes bodies.
 const (
 	chainChainRequest0  = "GET /a HTTP/1.1\r\nHost: origin.example\r\n\r\n"
 	chainChainResponse0 = "HTTP/1.1 301 Moved Permanently\r\nContent-Length: 12\r\nLocation: /b\r\n\r\n"
@@ -93,8 +53,8 @@ const (
 	chainChainResponse2 = "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n"
 )
 
-// Measured dumps for the single-hop fixture. The body is 15 bytes, hence the declared
-// length, and the response dump still stops at the header terminator.
+// Expected header-only dumps for the single-hop fixture; its 15-byte body appears only
+// as Content-Length.
 const (
 	chainSingleRequestDump  = "GET /only HTTP/1.1\r\nHost: origin.example\r\n\r\n"
 	chainSingleResponseDump = "HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n"
@@ -105,19 +65,9 @@ const (
 // TestChainDumpsCarryNoBody asserts.
 const chainHeaderTerminator = "\r\n\r\n"
 
-// newChainFixture drives the canonical three-hop chain 301 /a -> 301 /b -> 200 /c on
-// origin.example and returns the parsed response together with the recording transport.
-//
-// The Location headers are scripted RELATIVE ("/b", "/c") on purpose. The chain builder
-// derives each item's Location from http.Response.Location(), which resolves a relative
-// field against the request URL, so relative scripting is the only form under which the
-// absolute Location values asserted in TestChainAccessorsMultiHop prove that resolution
-// actually happened. Scripting them absolute would make the resolution a no-op and
-// silently drain that assertion of all power.
-//
-// Every hop returns a distinct body marker so TestChainDumpsCarryNoBody can prove no
-// body byte reaches any dump, and the transport is returned so a caller can cross-check
-// the chain's own RequestURL sequence against the requests that genuinely went out.
+// newChainFixture creates 301 /a -> 301 /b -> 200 /c with relative Locations. Relative
+// values let tests distinguish wire header bytes from the absolute Locations resolved by
+// the chain builder. Distinct body markers verify dumps exclude bodies.
 func newChainFixture(t *testing.T) (*Response, *mockTransport) {
 	t.Helper()
 
@@ -129,14 +79,16 @@ func newChainFixture(t *testing.T) (*Response, *mockTransport) {
 		"origin.example/c": {status: http.StatusOK, body: chainBodyMarkerC},
 	}))
 
-	// The mutator runs before New, which is mandatory: New freezes the option values
-	// into the CheckRedirect closure it builds (common/httpx/httpx.go:92-115), so a
-	// redirect flag set afterwards would never be seen and the chain would stay one
-	// item long while every assertion below silently changed meaning.
+	// Set FollowRedirects before New because New selects the CheckRedirect closure
+	// during construction; changing the flag afterwards cannot replace the selected
+	// closure.
 	ht := newMockHTTPX(t, func(options *Options) {
 		options.FollowRedirects = true
 		options.MaxRedirects = chainMaxRedirects
 	}, mt)
+	// Close the disk-backed fastdialer state created by New; the mock transport
+	// bypasses it but does not disable its resources.
+	t.Cleanup(ht.Dialer.Close)
 
 	req, err := retryablehttp.NewRequest(http.MethodGet, chainTargetA, nil)
 	require.NoError(t, err, "the fixture target must parse, otherwise no hop ever reaches the chain builder")
@@ -154,21 +106,9 @@ func newChainFixture(t *testing.T) (*Response, *mockTransport) {
 	return resp, mt
 }
 
-// newTwoHopChainFixture drives a single redirect, 302 /a -> 200 /b on origin.example,
-// producing a chain of exactly TWO items, and returns the parsed response with the
-// recording transport.
-//
-// Chain length two is not an arbitrary second fixture: it is the ONLY length that
-// discriminates HasChain's `len(r.Chain) > 1` (common/httpx/response.go:100) from a
-// neighbouring off-by-one. Under a mutated `> 2` the three-item fixture still reports
-// true and the one-item fixture still reports false, so the defect would be invisible
-// without this case. Chain length two is also a second arity for GetChain's two loop
-// conditions, where the dump collapses to response0 + request1 - one write from each
-// branch, with each branch's omission still in force.
-//
-// A 302 is used rather than the 301 of the three-hop fixture so the two fixtures are
-// distinguishable in the status-code sequence they produce, and net/http rewrites the
-// follow-up to GET for both.
+// newTwoHopChainFixture creates 302 /a -> 200 /b. A two-item chain is the minimum
+// HasChain boundary and reduces GetChain to response0+request1, exercising each write
+// branch once.
 func newTwoHopChainFixture(t *testing.T) (*Response, *mockTransport) {
 	t.Helper()
 
@@ -181,6 +121,7 @@ func newTwoHopChainFixture(t *testing.T) (*Response, *mockTransport) {
 		options.FollowRedirects = true
 		options.MaxRedirects = chainMaxRedirects
 	}, mt)
+	t.Cleanup(ht.Dialer.Close)
 
 	req, err := retryablehttp.NewRequest(http.MethodGet, chainTargetA, nil)
 	require.NoError(t, err, "the boundary fixture target must parse, otherwise no hop reaches the chain builder")
@@ -197,19 +138,9 @@ func newTwoHopChainFixture(t *testing.T) (*Response, *mockTransport) {
 	return resp, mt
 }
 
-// TestChainAccessorsMultiHop pins the caller-visible values every chain accessor reports
-// for a three-hop redirect chain.
-//
-// The final-URL assertion is the reason this file exists: GetChainLastURL
-// (common/httpx/response.go:104-110) returns the last item's RequestURL, and the runner
-// emits exactly that value as a scan's resolved URL (runner/runner.go:2339-2343). It is
-// asserted as one exact absolute URL string, never as a substring or a non-emptiness
-// check.
-//
-// The status-code sequence is compared with require.Equal rather than ElementsMatch
-// because chain order is semantically meaningful - [301 301 200] and [200 301 301]
-// describe different scans - and an order-insensitive comparison would accept a reversal
-// of the builder's final ordering pass.
+// TestChainAccessorsMultiHop verifies status order, resolved Locations, RequestURLs,
+// HasChain, and the exact final URL consumed by runner output. Relative fixture Locations
+// ensure absolute projected values prove resolution rather than copying.
 func TestChainAccessorsMultiHop(t *testing.T) {
 	resp, mt := newChainFixture(t)
 
@@ -221,7 +152,6 @@ func TestChainAccessorsMultiHop(t *testing.T) {
 	require.True(t, resp.HasChain(),
 		"HasChain is len(r.Chain) > 1 (response.go:100), which a three-item chain satisfies")
 
-	// The user-facing final URL after the redirect chain, exact and absolute.
 	require.Equal(t, chainTargetC, resp.GetChainLastURL(),
 		"GetChainLastURL must be the absolute URL of the last hop actually requested")
 
@@ -253,10 +183,9 @@ func TestChainAccessorsMultiHop(t *testing.T) {
 	require.Equal(t, []string{chainTargetA, chainTargetB, chainTargetC}, requestURLs,
 		"RequestURL must name the absolute URL each hop was sent to, in progressive order")
 
-	// Resolution proof: the origin sent a RELATIVE Location on the wire, and the chain
-	// item exposes the ABSOLUTE form. Both halves are asserted so neither can drift
-	// without failing - a builder that stopped resolving, or a mock that started
-	// scripting absolute headers, breaks exactly one of the two.
+	// The fixture sends relative Location headers; comparing the response dump with the
+	// absolute projected Location verifies that the builder resolved, rather than copied,
+	// the value.
 	require.Contains(t, slice[0].Response, "Location: /b"+chainHeaderTerminator,
 		"the first hop's response dump must show the relative Location bytes the origin actually sent")
 	require.Equal(t, chainTargetB, slice[0].Location,
@@ -273,12 +202,8 @@ func TestChainAccessorsMultiHop(t *testing.T) {
 		[]string{hops[0].Method, hops[1].Method, hops[2].Method},
 		"a 301 rewrites the follow-up to GET, so every hop of this chain must be a GET")
 
-	// The HasChain boundary, which the three-item chain above cannot reach. HasChain is
-	// len(r.Chain) > 1 (response.go:100), so length TWO is the only length that
-	// distinguishes that predicate from an off-by-one: a mutated `> 2` still reports true
-	// for three items and false for one, and would slip past every other assertion in
-	// this file. Two is the lowest length for which HasChain must be true, and
-	// TestChainSingleItemAccessors pins the highest length for which it must be false.
+	// A two-item chain is the minimum value for which HasChain must return true;
+	// TestChainSingleItemAccessors covers the false boundary.
 	t.Run("a two item chain is the lowest length HasChain accepts", func(t *testing.T) {
 		boundary, boundaryTransport := newTwoHopChainFixture(t)
 
@@ -308,24 +233,10 @@ func TestChainAccessorsMultiHop(t *testing.T) {
 	})
 }
 
-// TestChainGetChainOmitsFirstRequestAndLastResponse pins the exact composition of the
-// concatenated chain dump, which is the most structurally load-bearing behavior in
-// response.go.
-//
-// PINNED DIVERGENCE - asserted as measured, deliberately NOT fixed. GetChain
-// (common/httpx/response.go:71-82) writes chainItem.Request for every index EXCEPT 0,
-// because of `if counter != 0` at response.go:74, and chainItem.Response for every index
-// EXCEPT the last, because of `if counter < len(r.Chain)-1` at response.go:77. The dump
-// is therefore response0 + request1 + response1 + request2 and nothing else: the
-// caller's own first request and the final response never appear, even though
-// GetChainAsSlice does carry both. A reader who expected a complete transcript is not
-// wrong to be surprised, but the runner's output layer consumes this string as-is, so
-// changing it would change every user's output and it is out of scope to fix.
-//
-// The assertions come in three strengths on purpose. The byte-exact equalities state
-// what the dump IS; the presence checks state which hops survived; the absence checks
-// are what make the test mutation-resistant, because dropping either loop condition
-// would add bytes that no equality-only test phrased against a prefix could catch.
+// TestChainGetChainOmitsFirstRequestAndLastResponse verifies GetChain's loop contract:
+// index 0 contributes no request and the final index contributes no response. For three
+// items the exact composition is response0+request1+response1+request2; GetChainAsSlice
+// still retains the omitted fields.
 func TestChainGetChainOmitsFirstRequestAndLastResponse(t *testing.T) {
 	resp, _ := newChainFixture(t)
 
@@ -335,20 +246,16 @@ func TestChainGetChainOmitsFirstRequestAndLastResponse(t *testing.T) {
 	dump := resp.GetChain()
 	require.NotEmpty(t, dump, "a three-item chain must produce a dump; only a single-item chain yields the empty string")
 
-	// Composition, expressed in terms of the items themselves: response0 + request1 +
-	// response1 + request2. This is the assertion that fails the moment either loop
-	// condition at response.go:74 or :77 changes.
+	// Compose the expected dump from projected items to exercise both loop conditions
+	// directly.
 	require.Equal(t, slice[0].Response+slice[1].Request+slice[1].Response+slice[2].Request, dump,
 		"the dump must be exactly response0+request1+response1+request2, per the two loop conditions at response.go:74 and :77")
 
-	// The same statement again as literal bytes, so a change in what the builder dumps
-	// - not just in how GetChain concatenates it - also fails here.
 	require.Equal(t, chainChainResponse0+chainChainRequest1+chainChainResponse1+chainChainRequest2, dump,
 		"the dump must match the measured bytes for this fixture exactly")
 	require.Len(t, dump, 286,
 		"68+75+68+75 bytes for this fixture, which is stable because every hop declares the same 12-byte length")
 
-	// Presence: the hops that do survive the omissions.
 	require.Contains(t, dump, "Location: /b"+chainHeaderTerminator,
 		"the first response survives, carrying the relative Location bytes the origin sent")
 	require.Contains(t, dump, "GET /b HTTP/0.0",
@@ -379,12 +286,8 @@ func TestChainGetChainOmitsFirstRequestAndLastResponse(t *testing.T) {
 	require.NotContains(t, dump, "Location: "+chainTargetB,
 		"the dump carries the relative Location the origin sent, so the resolved absolute form must not appear as a field")
 
-	// The same two omissions at a second arity. With exactly two items the dump collapses
-	// to response0 + request1: index 0 contributes only its response and index 1 only its
-	// request, so each loop condition fires exactly once and each omission is still in
-	// force. Asserting this length as well as three closes the gap a single-arity test
-	// leaves - a mutated condition can agree with the correct one at one chain length and
-	// disagree at another.
+	// With two items, GetChain reduces to response0+request1, exercising each write
+	// branch once while preserving both omissions.
 	t.Run("a two item chain omits the same two pieces", func(t *testing.T) {
 		boundary, _ := newTwoHopChainFixture(t)
 
@@ -415,20 +318,9 @@ func TestChainGetChainOmitsFirstRequestAndLastResponse(t *testing.T) {
 	})
 }
 
-// TestChainDumpsCarryNoBody pins that no chain item's dump carries a single body byte,
-// while the body itself still reaches the caller.
-//
-// The cause is structural and upstream: the chain builder calls
-// httputil.DumpRequest(req, false) and httputil.DumpResponse(resp, false) - body=false
-// on both - so each dump stops at the header terminator. It is a property of
-// pdhttputil.GetChain, invoked from common/httpx/httpx.go:397, not of this repository's
-// own code, which is why it is pinned rather than changed.
-//
-// Every hop returns a distinct body marker, and each item is checked against ALL THREE
-// markers rather than only its own, so a builder that dumped the wrong hop's body would
-// fail too. The dumps are also asserted non-empty and shown to declare a Content-Length:
-// a dump that reported a 12-byte payload while carrying none is the exact evidence that
-// the omission is deliberate framing rather than an empty response.
+// TestChainDumpsCarryNoBody verifies that the upstream builder records headers only: it
+// calls DumpRequest and DumpResponse with body=false. Distinct markers confirm no dump
+// contains any hop body, while resp.Data still contains the terminal body.
 func TestChainDumpsCarryNoBody(t *testing.T) {
 	resp, _ := newChainFixture(t)
 
@@ -482,7 +374,6 @@ func TestChainDumpsCarryNoBody(t *testing.T) {
 		})
 	}
 
-	// The concatenated dump inherits the property: no marker anywhere in it either.
 	dump := resp.GetChain()
 	for _, marker := range allMarkers {
 		require.NotContains(t, dump, marker,
@@ -490,31 +381,17 @@ func TestChainDumpsCarryNoBody(t *testing.T) {
 	}
 }
 
-// TestChainRedirectHopsDumpProtoZero pins a distinctive and highly mutation-sensitive
-// artifact: only the caller's own request dumps a real protocol version, while every
-// redirect follow-up dumps HTTP/0.0.
-//
-// The caller's request is built by retryablehttp on top of http.NewRequestWithContext,
-// which stamps Proto "HTTP/1.1" with ProtoMajor 1 and ProtoMinor 1. net/http builds a
-// redirect follow-up itself and leaves those fields at their zero values, so
-// httputil.DumpRequest formats the request line as HTTP/0.0. That is surfaced verbatim
-// by the chain builder and reaches the runner's chain output.
-//
-// It is pinned as measured, not fixed: the zero-valued protocol fields originate in the
-// standard library's redirect handling, and asserting them makes any change to how the
-// chain is reconstructed - or to which request object each item points at - fail loudly.
-//
-// Index 0 is read from GetChainAsSlice rather than from GetChain, because GetChain omits
-// the first request altogether (see
-// TestChainGetChainOmitsFirstRequestAndLastResponse), whereas GetChainAsSlice copies
-// every field unconditionally at response.go:87-93.
+// TestChainRedirectHopsDumpProtoZero verifies that the original request dump carries
+// HTTP/1.1 while redirect-generated requests dump as HTTP/0.0. NewRequestWithContext
+// initializes the original request's protocol fields; net/http's redirect request leaves
+// them zero, and upstream DumpRequest surfaces those values. GetChainAsSlice is used for
+// index 0 because GetChain omits the first request.
 func TestChainRedirectHopsDumpProtoZero(t *testing.T) {
 	resp, _ := newChainFixture(t)
 
 	slice := resp.GetChainAsSlice()
 	require.Len(t, slice, 3, "precondition: all three request dumps must be projected")
 
-	// The caller's own request: a real protocol version.
 	require.True(t, strings.HasPrefix(slice[0].Request, "GET /a HTTP/1.1\r\n"),
 		"the first item is the caller's own request, which net/http stamped with HTTP/1.1")
 	require.Equal(t, chainChainRequest0, slice[0].Request,
@@ -545,7 +422,6 @@ func TestChainRedirectHopsDumpProtoZero(t *testing.T) {
 		})
 	}
 
-	// The same contrast inside the concatenated dump, which is what the runner emits.
 	dump := resp.GetChain()
 	require.Contains(t, dump, "GET /b HTTP/0.0",
 		"the concatenated dump must carry the follow-up's zero-valued protocol version too")
@@ -553,28 +429,10 @@ func TestChainRedirectHopsDumpProtoZero(t *testing.T) {
 		"a follow-up request line with a real protocol version must not appear anywhere in the dump")
 }
 
-// TestChainSingleItemAccessors pins the accessors' behavior when no redirect happened at
-// all, which is the common case for a scan and therefore the case a defect would hide in
-// longest.
-//
-// PINNED DIVERGENCE - asserted as measured, deliberately NOT fixed. GetChain
-// (common/httpx/response.go:71-82) returns the EMPTY STRING for a single-item chain,
-// even though that item holds a complete request dump and a complete response dump. Both
-// loop conditions exclude index 0 when it is also the final index: `if counter != 0` at
-// response.go:74 skips the request, and `if counter < len(r.Chain)-1` at response.go:77
-// skips the response, so the builder writes nothing at all. This is the same pair of
-// conditions pinned in TestChainGetChainOmitsFirstRequestAndLastResponse, and it is left
-// alone for the same reason: the runner consumes the string as-is.
-//
-// A second, smaller surprise is pinned alongside it. The item's Location is the empty
-// string, not the request URL: the chain builder derives Location from
-// http.Response.Location(), which returns http.ErrNoLocation for a response without a
-// Location header and leaves the field at its zero value. RequestURL is asserted
-// immediately afterwards so the item is provably populated and the two fields are
-// visibly distinct.
-//
-// Both empty results are asserted as exact empty-string equality. Neither is asserted as
-// a nil check, which would pass for a value that had merely stopped being computed.
+// TestChainSingleItemAccessors verifies the no-redirect boundary. A single item makes
+// HasChain false and GetChainLastURL empty. Both GetChain loop conditions omit the sole
+// item, so GetChain is empty even though GetChainAsSlice retains the request and response
+// dumps; Location remains empty because the 200 has no Location header.
 func TestChainSingleItemAccessors(t *testing.T) {
 	// A plain 200 with no Location header, so no redirect can occur.
 	mt := newMockTransport(t, scriptedRedirects(t, map[string]mockHop{
@@ -588,6 +446,7 @@ func TestChainSingleItemAccessors(t *testing.T) {
 		options.FollowRedirects = true
 		options.MaxRedirects = chainMaxRedirects
 	}, mt)
+	t.Cleanup(ht.Dialer.Close)
 
 	req, err := retryablehttp.NewRequest(http.MethodGet, chainSingleTarget, nil)
 	require.NoError(t, err, "the fixture target must parse, otherwise the accessors are never reached")
@@ -624,4 +483,332 @@ func TestChainSingleItemAccessors(t *testing.T) {
 		"the projection carries the full response dump even though GetChain omitted it")
 	require.NotEmpty(t, slice[0].Request, "the omitted request dump is non-empty, so the empty GetChain is the loop's doing")
 	require.NotEmpty(t, slice[0].Response, "the omitted response dump is non-empty, so the empty GetChain is the loop's doing")
+}
+
+// Synthetic sentinels represent Authorization, Proxy-Authorization, Cookie, a bespoke
+// API-key header, Set-Cookie, and a terminal response header so each carrier is
+// distinguishable in the serialized chain.
+const (
+	chainSecretAuthorization      = "Bearer SENTINEL-TOKEN"
+	chainSecretCookie             = "sess=SENTINEL-COOKIE"
+	chainSecretProxyAuthorization = "Basic SENTINEL-PROXY"
+	chainSecretAPIKeyHeader       = "X-Api-Key"
+	chainSecretAPIKey             = "SENTINEL-APIKEY"
+	chainSecretSetCookie          = "session=SENTINEL-SETCOOKIE; Path=/"
+	chainSecretResponseHeader     = "X-Response-Secret"
+	chainSecretResponseValue      = "SENTINEL-RESPHDR"
+)
+
+// Expected header-only dumps for the two-hop credential fixture. Headers are set directly
+// to avoid RandomAgent changing the byte-exact request dump; net/http writes Host first
+// and sorts the remaining fields.
+const (
+	chainSecretRequest0 = "GET /a HTTP/1.1\r\n" +
+		"Host: origin.example\r\n" +
+		"Authorization: " + chainSecretAuthorization + "\r\n" +
+		"Cookie: " + chainSecretCookie + "\r\n" +
+		"Proxy-Authorization: " + chainSecretProxyAuthorization + "\r\n" +
+		chainSecretAPIKeyHeader + ": " + chainSecretAPIKey + "\r\n\r\n"
+	chainSecretResponse0 = "HTTP/1.1 301 Moved Permanently\r\n" +
+		"Content-Length: 12\r\n" +
+		"Location: /b\r\n" +
+		"Set-Cookie: " + chainSecretSetCookie + "\r\n\r\n"
+	chainSecretRequest1 = "GET /b HTTP/0.0\r\n" +
+		"Host: origin.example\r\n" +
+		"Authorization: " + chainSecretAuthorization + "\r\n" +
+		"Cookie: " + chainSecretCookie + "\r\n" +
+		"Proxy-Authorization: " + chainSecretProxyAuthorization + "\r\n" +
+		"Referer: " + chainTargetA + "\r\n" +
+		chainSecretAPIKeyHeader + ": " + chainSecretAPIKey + "\r\n\r\n"
+	chainSecretResponse1 = "HTTP/1.1 200 OK\r\n" +
+		"Content-Length: 12\r\n" +
+		chainSecretResponseHeader + ": " + chainSecretResponseValue + "\r\n\r\n"
+)
+
+// TestChainDumpsExposeSensitiveHeaders verifies that same-origin chain dumps retain
+// request credentials and response headers verbatim. GetChain is written by StoreChain,
+// while GetChainAsSlice populates JSON chain output; neither accessor redacts upstream
+// dump bytes. Same-origin routing isolates chain serialization from cross-origin header
+// stripping.
+func TestChainDumpsExposeSensitiveHeaders(t *testing.T) {
+	// Two hops on ONE origin. Same-origin is deliberate: it removes net/http's
+	// cross-origin stripping from the picture entirely, so what the dumps contain is
+	// attributable to the chain builder alone rather than to redirect header policy,
+	// which is the separate subject of common/httpx/redirect_test.go.
+	mt := newMockTransport(t, scriptedRedirects(t, map[string]mockHop{
+		"origin.example/a": {
+			status:   http.StatusMovedPermanently,
+			location: "/b",
+			header:   http.Header{"Set-Cookie": []string{chainSecretSetCookie}},
+			body:     chainBodyMarkerA,
+		},
+		"origin.example/b": {
+			status: http.StatusOK,
+			header: http.Header{chainSecretResponseHeader: []string{chainSecretResponseValue}},
+			body:   chainBodyMarkerB,
+		},
+	}))
+
+	ht := newMockHTTPX(t, func(options *Options) {
+		options.FollowRedirects = true
+		options.MaxRedirects = chainMaxRedirects
+	}, mt)
+	t.Cleanup(ht.Dialer.Close)
+
+	req, err := retryablehttp.NewRequest(http.MethodGet, chainTargetA, nil)
+	require.NoError(t, err, "the fixture target must parse, otherwise no hop reaches the chain builder")
+	// Set directly, NOT via SetCustomHeaders - see the note on the dump constants.
+	req.Header.Set("Authorization", chainSecretAuthorization)
+	req.Header.Set("Cookie", chainSecretCookie)
+	req.Header.Set("Proxy-Authorization", chainSecretProxyAuthorization)
+	req.Header.Set(chainSecretAPIKeyHeader, chainSecretAPIKey)
+
+	resp, err := ht.Do(req, UnsafeOptions{})
+	require.NoError(t, err, "the scripted chain must complete, so an exposure assertion cannot be a failed request in disguise")
+	require.Equal(t, 2, mt.callCount(), "exactly two round trips must reach the transport, so the chain describes real traffic")
+	require.Equal(t, http.StatusOK, resp.StatusCode, "the 301 must have been followed to the terminal 200")
+	require.Len(t, resp.Chain, 2, "precondition: the builder must have reconstructed both hops")
+
+	require.Equal(t, chainSecretRequest0, string(resp.Chain[0].Request),
+		"the first hop's request dump carries all four credentials verbatim")
+	require.Equal(t, chainSecretResponse0, string(resp.Chain[0].Response),
+		"the first hop's response dump carries the origin's Set-Cookie verbatim")
+	require.Equal(t, chainSecretRequest1, string(resp.Chain[1].Request),
+		"the redirect follow-up repeats every credential, and adds the Referer")
+	require.Equal(t, chainSecretResponse1, string(resp.Chain[1].Response),
+		"the terminal response dump carries the bespoke response secret")
+
+	require.Len(t, resp.Chain[0].Request, 180)
+	require.Len(t, resp.Chain[0].Response, 116)
+	require.Len(t, resp.Chain[1].Request, 214)
+	require.Len(t, resp.Chain[1].Response, 76)
+
+	chain := resp.GetChain()
+	require.Equal(t, chainSecretResponse0+chainSecretRequest1, chain,
+		"GetChain is response0 + request1, so the file written under -store-chain is exactly these bytes")
+	require.Len(t, chain, 330)
+
+	// The documented omissions give NO confidentiality, and that is the point of the
+	// next two groups. GetChain drops request0, yet every credential request0 held is
+	// still present - because request1 repeats all of them.
+	require.NotContains(t, chain, chainSecretRequest0,
+		"the first request dump is omitted as a whole, per the divergence pinned in TestChainGetChainOmitsFirstRequestAndLastResponse")
+	for _, secret := range []string{
+		chainSecretAuthorization,
+		chainSecretCookie,
+		chainSecretProxyAuthorization,
+		chainSecretAPIKey,
+		chainSecretSetCookie,
+	} {
+		require.Contains(t, chain, secret,
+			"omitting the first request does not withhold this credential: the follow-up hop repeats it")
+	}
+
+	// The last-response omission, by contrast, DOES withhold the terminal response's
+	// bespoke secret from GetChain - and only from GetChain. Asserted as an absence so
+	// a change that started including the final response is caught here.
+	require.NotContains(t, chain, chainSecretResponseValue,
+		"the terminal response is omitted from GetChain, so its bespoke secret does not reach the -store-chain file")
+
+	// The concatenated dump remains body-free; all exposed sentinel data is carried in
+	// headers.
+	require.NotContains(t, chain, chainBodyMarkerA, "GetChain carries header bytes only")
+	require.NotContains(t, chain, chainBodyMarkerB, "GetChain carries header bytes only")
+
+	// GetChainAsSlice retains every request and response dump, including the terminal
+	// response omitted by GetChain.
+	slice := resp.GetChainAsSlice()
+	require.Len(t, slice, 2, "the projection reports one item per hop")
+
+	require.Equal(t, chainSecretRequest0, slice[0].Request,
+		"chain[0].request in JSON output is the first request dump in full, credentials included")
+	require.Equal(t, chainSecretResponse0, slice[0].Response,
+		"chain[0].response in JSON output carries the Set-Cookie")
+	require.Equal(t, chainSecretRequest1, slice[1].Request,
+		"chain[1].request in JSON output repeats every credential")
+	require.Equal(t, chainSecretResponse1, slice[1].Response,
+		"chain[1].response in JSON output exposes the terminal response secret that GetChain withheld")
+
+	// The decisive contrast between the two accessors, stated as one pair of assertions:
+	// the same secret is absent from one representation and present in the other, so a
+	// reader cannot conclude from the -store-chain behaviour that JSON is equally narrow.
+	require.NotContains(t, chain, chainSecretResponseValue,
+		"absent from GetChain")
+	require.Contains(t, slice[1].Response, chainSecretResponseValue,
+		"present in GetChainAsSlice - the two accessors expose different amounts, so both must be audited")
+
+	require.Equal(t, []int{http.StatusMovedPermanently, http.StatusOK}, resp.GetChainStatusCodes())
+	require.True(t, resp.HasChain())
+	require.Equal(t, chainTargetB, resp.GetChainLastURL(),
+		"the final URL is the plain target here; the credential-bearing case is TestChainRetainsURLUserinfoInCallerVisibleOutput")
+	require.Equal(t, chainTargetB, slice[0].Location, "the resolved Location of the first hop")
+	require.Equal(t, "", slice[1].Location, "the terminal hop has no Location")
+	require.Equal(t, chainTargetA, slice[0].RequestURL)
+	require.Equal(t, chainTargetB, slice[1].RequestURL)
+}
+
+// Synthetic URL-userinfo fixtures pair a cleartext password with its exact Basic encoding
+// so the test can verify both URL fields and derived Authorization dumps.
+const (
+	chainUserinfoUser     = "alice"
+	chainUserinfoPassword = "s3cr3t-password"
+	chainUserinfoBasic    = "Basic YWxpY2U6czNjcjN0LXBhc3N3b3Jk"
+
+	chainUserinfoStart = "http://" + chainUserinfoUser + ":" + chainUserinfoPassword + "@origin.example/start"
+	chainUserinfoFinal = "http://" + chainUserinfoUser + ":" + chainUserinfoPassword + "@origin.example/final"
+	chainPlainStart    = "http://origin.example/start"
+	chainPlainFinal    = "http://origin.example/final"
+)
+
+// TestChainRetainsURLUserinfoInCallerVisibleOutput compares relative and absolute
+// redirect Locations for a target containing URL userinfo. A relative Location inherits
+// the base URL's userinfo, so the resolved Location, follow-up RequestURL, final URL, and
+// derived Basic header retain it; an absolute Location without userinfo does not. The
+// first chain item still records the original credential-bearing URL and request dump.
+// net/http strips userinfo from the synthesized Referer, providing a control.
+func TestChainRetainsURLUserinfoInCallerVisibleOutput(t *testing.T) {
+	cases := []struct {
+		name string
+		// scriptedLocation is the ONLY difference between the two rows.
+		scriptedLocation string
+		wantLastURL      string
+		// wantCredentialInLastURL separately records whether the expected final URL
+		// contains the password sentinel.
+		wantCredentialInLastURL bool
+		wantItem0Response       string
+		wantItem1Request        string
+		wantChainBytes          int
+		wantSlice0Location      string
+		wantSlice1RequestURL    string
+		// wantHop1Authorization is what the SECOND hop actually put on the wire.
+		wantHop1Authorization string
+	}{
+		{
+			name:                    "relative Location propagates the URL password into the final URL",
+			scriptedLocation:        "/final",
+			wantLastURL:             chainUserinfoFinal,
+			wantCredentialInLastURL: true,
+			wantItem0Response: "HTTP/1.1 302 Found\r\n" +
+				"Content-Length: 12\r\n" +
+				"Location: /final\r\n\r\n",
+			wantItem1Request: "GET /final HTTP/0.0\r\n" +
+				"Host: origin.example\r\n" +
+				"Authorization: " + chainUserinfoBasic + "\r\n" +
+				"Referer: " + chainPlainStart + "\r\n\r\n",
+			wantChainBytes:        194,
+			wantSlice0Location:    chainUserinfoFinal,
+			wantSlice1RequestURL:  chainUserinfoFinal,
+			wantHop1Authorization: chainUserinfoBasic,
+		},
+		{
+			name:                    "absolute Location keeps the final URL clean but still leaks the first hop",
+			scriptedLocation:        chainPlainFinal,
+			wantLastURL:             chainPlainFinal,
+			wantCredentialInLastURL: false,
+			wantItem0Response: "HTTP/1.1 302 Found\r\n" +
+				"Content-Length: 12\r\n" +
+				"Location: " + chainPlainFinal + "\r\n\r\n",
+			wantItem1Request: "GET /final HTTP/0.0\r\n" +
+				"Host: origin.example\r\n" +
+				"Referer: " + chainPlainStart + "\r\n\r\n",
+			wantChainBytes:        164,
+			wantSlice0Location:    chainPlainFinal,
+			wantSlice1RequestURL:  chainPlainFinal,
+			wantHop1Authorization: "",
+		},
+	}
+
+	// The first hop's dump is identical on both rows - it is the caller's own request,
+	// which the scripted Location cannot influence - so it is stated once here rather
+	// than duplicated per row, which is itself the assertion that it is row-invariant.
+	const wantItem0Request = "GET /start HTTP/1.1\r\n" +
+		"Host: origin.example\r\n" +
+		"Authorization: " + chainUserinfoBasic + "\r\n\r\n"
+	const wantItem1Response = "HTTP/1.1 200 OK\r\n" +
+		"Content-Length: 12\r\n\r\n"
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mt := newMockTransport(t, scriptedRedirects(t, map[string]mockHop{
+				"origin.example/start": {status: http.StatusFound, location: tc.scriptedLocation, body: chainBodyMarkerA},
+				"origin.example/final": {status: http.StatusOK, body: chainBodyMarkerB},
+			}))
+
+			ht := newMockHTTPX(t, func(options *Options) {
+				options.FollowRedirects = true
+				options.MaxRedirects = chainMaxRedirects
+			}, mt)
+			t.Cleanup(ht.Dialer.Close)
+
+			req, err := retryablehttp.NewRequest(http.MethodGet, chainUserinfoStart, nil)
+			require.NoError(t, err, "a userinfo-bearing target must parse, otherwise the scenario never runs")
+			// The credential is carried ONLY by the URL. Nothing sets an Authorization
+			// header here, so every Authorization byte asserted below was synthesized by
+			// net/http from that userinfo.
+			require.Empty(t, req.Header.Get("Authorization"),
+				"precondition: the caller sets no Authorization, so the header is provably derived from the URL")
+
+			resp, err := ht.Do(req, UnsafeOptions{})
+			require.NoError(t, err, "the scripted redirect must complete")
+			require.Equal(t, 2, mt.callCount(), "exactly two round trips, so the chain describes real traffic")
+			require.Equal(t, http.StatusOK, resp.StatusCode, "the 302 must have been followed to the terminal 200")
+			require.Len(t, resp.Chain, 2, "precondition: both hops must be in the chain")
+
+			require.Equal(t, tc.wantLastURL, resp.GetChainLastURL(),
+				"GetChainLastURL is emitted verbatim as JSON final_url and printed under -location")
+			require.Equal(t, tc.wantCredentialInLastURL, strings.Contains(resp.GetChainLastURL(), chainUserinfoPassword),
+				"whether the cleartext password reaches Result.FinalURL is decided solely by the Location form")
+
+			slice := resp.GetChainAsSlice()
+			require.Len(t, slice, 2)
+
+			require.Equal(t, tc.wantSlice0Location, slice[0].Location,
+				"the resolved Location is emitted as chain[0].location")
+			require.Equal(t, "", slice[1].Location, "the terminal hop has no Location")
+			require.Equal(t, tc.wantSlice1RequestURL, slice[1].RequestURL,
+				"chain[1].request-url is the follow-up target, which inherits userinfo only from a relative Location")
+
+			// The row-invariant leak: the FIRST hop's request URL is the caller's own, so
+			// it retains the password on BOTH rows. Asserted unconditionally, outside the
+			// table, because that is precisely what makes it unavoidable.
+			require.Equal(t, chainUserinfoStart, slice[0].RequestURL,
+				"chain[0].request-url always retains the caller's userinfo, so an absolute Location narrows the leak but never closes it")
+			require.Contains(t, slice[0].RequestURL, chainUserinfoPassword,
+				"the cleartext password is present in chain[0].request-url on every row")
+
+			require.Equal(t, wantItem0Request, string(resp.Chain[0].Request),
+				"the first request dump is row-invariant and carries the derived Basic credential")
+			require.Equal(t, tc.wantItem0Response, string(resp.Chain[0].Response))
+			require.Equal(t, tc.wantItem1Request, string(resp.Chain[1].Request),
+				"the follow-up dump carries the credential again only when the Location was relative")
+			require.Equal(t, wantItem1Response, string(resp.Chain[1].Response))
+			require.Equal(t, tc.wantItem0Response+tc.wantItem1Request, resp.GetChain(),
+				"GetChain is response0 + request1, so these are the bytes -store-chain writes to disk")
+			require.Len(t, resp.GetChain(), tc.wantChainBytes)
+
+			// Decode the Basic value to verify the dump contains the recoverable
+			// user/password pair rather than an opaque marker.
+			require.Contains(t, string(resp.Chain[0].Request), chainUserinfoBasic,
+				"the first request dump carries the Basic value, on every row")
+			encoded := strings.TrimPrefix(chainUserinfoBasic, "Basic ")
+			decoded, err := base64.StdEncoding.DecodeString(encoded)
+			require.NoError(t, err, "the dumped Basic value must be well-formed base64, otherwise it is not the credential")
+			require.Equal(t, chainUserinfoUser+":"+chainUserinfoPassword, string(decoded),
+				"the dumped credential decodes to the exact user and cleartext password, so the artefact discloses both")
+
+			// The synthesized Referer strips userinfo even though the chain's URL and dump
+			// fields retain it.
+			hops := mt.requests()
+			require.Len(t, hops, 2)
+			require.Equal(t, chainUserinfoBasic, hops[0].Header.Get("Authorization"),
+				"the first hop carries the credential derived from the URL userinfo")
+			require.Equal(t, "", hops[0].Header.Get("Referer"), "the first hop has no Referer")
+			require.Equal(t, tc.wantHop1Authorization, hops[1].Header.Get("Authorization"),
+				"the second hop re-derives the credential only when the resolved URL still carried userinfo")
+			require.Equal(t, chainPlainStart, hops[1].Header.Get("Referer"),
+				"net/http strips userinfo from the Referer it synthesizes (client.go:160-169) - the same credential, handled correctly one field away")
+			require.NotContains(t, hops[1].Header.Get("Referer"), chainUserinfoPassword,
+				"stated as an absence so a change that stopped stripping the Referer fails here too")
+		})
+	}
 }

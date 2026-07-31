@@ -409,12 +409,19 @@ func (e *errReadCloser) Close() error {
 // shorten it through the option mutator.
 const mockClientTimeout = 2 * time.Second
 
-// newMockHTTPX copies DefaultOptions, applies mut before New so constructor-derived
-// state such as parsed cookies is initialized correctly, then installs rt on both
-// retryable transports. It rejects the unsafe and CDN options that could bypass the
-// mock or consult external data.
+// newMockHTTPX copies DefaultOptions, applies mut before construction so
+// constructor-derived state such as parsed cookies is initialized correctly, builds a
+// client with New, then installs rt on both retryable transports. It rejects the unsafe
+// and CDN options that could bypass the mock or consult external data.
 //
-// Running mut before New is mandatory, not stylistic. New parses
+// Every call constructs its OWN client, so isolation is per test by construction: no
+// option a test sets, and no field it mutates afterwards, can be observed by any other
+// test. That matters most for the redirect-policy tests, where the CheckRedirect
+// closure New installs captures the *Options pointer it was built with
+// (common/httpx/httpx.go:76, :98-143) - a client shared between two tests would let one
+// row's MaxRedirects describe another row's assertions.
+//
+// Running mut before construction is mandatory, not stylistic. New parses
 // CustomHeaders["Cookie"] into Options.customCookies and freezes the option values
 // into the CheckRedirect closure it builds, so a Cookie entry or a redirect flag set
 // after construction is never seen: setCustomCookies would silently do nothing and
@@ -444,10 +451,42 @@ func newMockHTTPX(t *testing.T, mut func(*Options), rt http.RoundTripper) *HTTPX
 
 	ht, err := New(&options)
 	require.NoError(t, err)
+	// Release the disk-backed dialer history this construction allocated; see
+	// registerDialerCleanup for why leaving it behind slows every later New down.
+	registerDialerCleanup(t, ht)
 
 	ht.client.HTTPClient.Transport = rt
 	ht.client.HTTPClient2.Transport = rt
 	return ht
+}
+
+// registerDialerCleanup releases the disk-backed dialer history that every New
+// allocates, at the end of the test that constructed the client.
+//
+// New unconditionally sets fastdialerOpts.WithDialerHistory = true
+// (common/httpx/httpx.go:64), and fastdialer answers that by opening a LevelDB store
+// under a fresh os.MkdirTemp("", "httpx") directory. Nothing reclaims it implicitly:
+// only (*fastdialer.Dialer).Close closes the store, and only that close triggers the
+// os.RemoveAll that deletes the directory. A test that constructs a client and returns
+// therefore leaves one directory behind for the lifetime of the process.
+//
+// Leaving them behind is not merely untidy, it is quadratic. Every subsequent
+// construction re-opens a store, and opening one first walks the whole temporary
+// directory and stats every entry whose name contains the executable name, to expire
+// stale stores. Each leaked directory therefore makes every later New slower, so a
+// package that constructs a handful of clients degrades from milliseconds to seconds
+// per construction. Registering the close is what keeps the added suite inside its
+// runtime budget as well as inside its resource budget.
+//
+// (*fastdialer.Dialer).Close returns nothing, so it satisfies t.Cleanup's func()
+// directly. Production does exactly the same thing at runner/runner.go:919. Cleanup
+// functions run last-in-first-out after the test finishes, which is strictly after the
+// final Do, so no in-flight request can observe a closed store.
+func registerDialerCleanup(t *testing.T, ht *HTTPX) {
+	t.Helper()
+	require.NotNil(t, ht, "registerDialerCleanup: a constructed client is required")
+	require.NotNil(t, ht.Dialer, "registerDialerCleanup: New must have allocated a dialer to close")
+	t.Cleanup(ht.Dialer.Close)
 }
 
 // Compile-time proof of the two interface contracts this harness has to satisfy:
