@@ -275,39 +275,32 @@ func TestDoBodyReadCapTruncatesOversizeBody(t *testing.T) {
 		})
 	}
 
-	// The same read-cap branch observed at its OTHER boundary: the sign of the field.
-	// The rows above all configure a positive cap, so a zero or negative
+	// The same read-cap branch observed at its OTHER boundary: the sign of the field. The
+	// rows above all configure a positive cap, so a zero or negative
 	// MaxResponseBodySizeToRead is the one response-body configuration they never reach.
-	// DefaultOptions carries DefaultMaxResponseBodySize (TestDefaultOptionsHasNonZeroReadSize),
-	// so this state exists only when a caller passes -rstr 0 or a library user zeroes the
-	// field - which is exactly why it needs pinning rather than assuming. It belongs under
-	// this subject because it is decided by the same guard at common/httpx/httpx.go:281.
+	// DefaultOptions carries DefaultMaxResponseBodySize, so this state exists only when a
+	// caller passes -rstr 0 or a library user zeroes the field, and it is decided by the
+	// same guard that selects the limiting branch.
 	//
-	// Two contracts are asserted per row, both MEASURED and both PINNED AS MEASURED
-	// rather than fixed, because either fix would be a THIRD production change to
-	// httpx.go and only FIX-1 and FIX-2 are authorized:
+	// Two contracts are asserted per row:
 	//
 	//   - A non-positive cap DISABLES the cap rather than bounding the read at zero: the
-	//     limiter is skipped entirely, so pdhttputil.DumpResponseHeadersAndRaw consumes
-	//     the whole body and resp.Raw carries all of it. Bounding this read, or defining
-	//     a zero cap as "no body", would change what every -rstr 0 user sees in Raw
-	//     output and in saved responses - a behaviour change to a pre-existing opt-out
-	//     rather than a bug fix. The resource consequence is real (an uncapped read is
-	//     unbounded memory for a hostile response), so it is stated as an exact byte
-	//     count instead of being left implicit.
+	//     limiter is skipped entirely, so pdhttputil.DumpResponseHeadersAndRaw consumes the
+	//     whole body and resp.Raw carries all of it. That is an uncapped read, which means
+	//     unbounded memory for a hostile response, so the consequence is stated as an exact
+	//     byte count rather than left implicit.
 	//   - How many times the body the TRANSPORT returned is closed, which is the state of
-	//     the connection after Do returns. MEASURED: a non-positive cap closes it exactly
-	//     once, because the dump drains and closes what it was handed before substituting
-	//     its in-memory copy; a POSITIVE cap closes it ZERO times, because the limiter
-	//     wraps it in io.NopCloser (httpx.go:285), which discards the original closer, so
-	//     the deferred drain-and-close at :286-291 can no longer reach the connection and
-	//     nothing else releases it. The zero is asserted rather than glossed over: it is
-	//     the exact shape of the leak, so a change that started releasing the body - or
-	//     that released it twice - fails here and is read as a deliberate decision rather
-	//     than an accident.
+	//     the connection after Do returns. A non-positive cap closes it exactly once,
+	//     because the dump drains and closes what it was handed before substituting its
+	//     in-memory copy. A POSITIVE cap closes it ZERO times: the limiting branch wraps the
+	//     body in io.NopCloser, which discards the original closer, so the deferred
+	//     drain-and-close can no longer reach the connection and nothing else releases it.
+	//     The zero is asserted rather than glossed over - it is the exact shape of the
+	//     unreleased body, so a change that started releasing it, or released it twice,
+	//     fails here.
 	//
-	// The positive-cap row is therefore both the control for the byte counts and the pin
-	// for the unreleased body.
+	// The positive-cap row is therefore both the control for the byte counts and the pin for
+	// the unreleased body.
 	t.Run("a non positive cap disables the cap", func(t *testing.T) {
 		// A recognizable 10-byte prefix, so a bounded read is proved to have kept the
 		// START of the body rather than some 64 bytes from elsewhere in it.

@@ -34,9 +34,9 @@ const (
 	chainSingleHopBody = "single hop body"
 )
 
-// chainMaxRedirects exceeds the fixture's two redirects, so the guard at
-// common/httpx/httpx.go:104 cannot terminate these chains; redirect-budget behavior is
-// covered in redirect_test.go.
+// chainMaxRedirects exceeds the fixture's two redirects, so the FollowRedirects budget
+// guard cannot terminate these chains; redirect-budget behavior is covered in
+// redirect_test.go.
 const chainMaxRedirects = 10
 
 // Expected header-only dumps for the three-hop fixture. The initial request carries
@@ -537,19 +537,16 @@ const (
 // It runs as a sub-test of TestChainDumpsCarryNoBody: both examine exactly what the dump
 // bytes do and do not contain, one for payload bytes and one for header values.
 //
-// SECURITY DISPOSITION. The consequence is a credential at rest, not on the wire: the chain
-// is written into the runner's -store-chain files and into its JSON output, so an
-// Authorization, Cookie or Proxy-Authorization value supplied for a target ends up verbatim
-// in a scan artifact that is routinely shared, diffed and archived. The dumps are produced
-// upstream by pdhttputil.GetChain and consumed unchanged by the accessors at
-// common/httpx/response.go:71-97.
+// SECURITY DISPOSITION. The consequence is a credential at rest, not on the wire: the chain is
+// written into the runner's -store-chain files and into its JSON output, so an Authorization,
+// Cookie or Proxy-Authorization value supplied for a target ends up verbatim in a scan artifact
+// that may be stored, exported, shared, or archived. The dumps are produced upstream by
+// pdhttputil.GetChain and consumed unchanged by the chain accessors, neither of which redacts.
 //
-// PINNED AS MEASURED AND NOT FIXED. Redacting them would mean either changing an upstream
-// dependency or rewriting the accessors in common/httpx/response.go, a source file this work
-// may not modify at all - its only permitted non-test change is the two minimal, separately
-// disclosed fixes in httpx.go - and it would change the content of every stored chain. The
-// assertions below therefore state exactly which values a dump carries, so the exposure is
-// documented and any change to it, in either direction, fails here.
+// Redaction would mean changing an upstream dependency or the accessors themselves, and would
+// change the content of every stored chain, so the exposure is pinned instead: the assertions below
+// state exactly which values a dump carries, and any change to that, in either direction, fails
+// here.
 func assertChainDumpsExposeSensitiveHeaders(t *testing.T) {
 	// Two hops on ONE origin. Same-origin is deliberate: it removes net/http's
 	// cross-origin stripping from the picture entirely, so what the dumps contain is
@@ -695,12 +692,11 @@ const (
 // as URL userinfo reaches the runner's location output, its JSON chain and its stored chain
 // files. An absolute Location narrows the exposure to that first item; it never removes it.
 //
-// PINNED AS MEASURED AND NOT FIXED, for the same reason as the dump exposure above: the
-// retention happens in the upstream chain builder and in the accessors in
-// common/httpx/response.go, neither of which this work may change, and redacting a final URL
-// would alter output every consumer parses. The two rows pin the exposure exactly - including
-// the control that net/http DOES strip userinfo from the synthesized Referer, which is what
-// shows the retention is the chain's behaviour and not the protocol's.
+// The retention is pinned rather than changed, for the same reason as the dump exposure above: it
+// happens in the upstream chain builder and in the chain accessors, and redacting a final URL would
+// alter output every consumer parses. The two rows pin the exposure exactly - including the control
+// that net/http DOES strip userinfo from the synthesized Referer, which is what shows the retention
+// is the chain's behaviour and not the protocol's.
 func assertChainRetainsURLUserinfoInCallerVisibleOutput(t *testing.T) {
 	cases := []struct {
 		name string

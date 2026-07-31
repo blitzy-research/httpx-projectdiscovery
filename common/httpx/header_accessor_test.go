@@ -108,14 +108,13 @@ func TestGetHeaderIsCaseSensitive(t *testing.T) {
 // redirect target containing one is reported to the operator SHORTER than the target the
 // client would actually follow - silently, with no error and no marker. An operator triaging
 // an open-redirect or an SSRF finding from that output is therefore reading a different URL
-// from the one on the wire, and the discarded remainder is exactly where a payload would sit.
+// from the one on the wire, and the discarded remainder may contain security-relevant query
+// parameters.
 //
-// PINNED AS MEASURED AND NOT FIXED. Narrowing the split would mean editing
-// common/httpx/response.go, a source file this work may not modify at all - its only
-// permitted non-test change is the two minimal, separately disclosed fixes in httpx.go - and
-// the split-and-take-first contract is what the media-type and cookie rows above depend on,
-// so it cannot be changed for one caller only. The row below pins the truncated value
-// exactly, so the loss is documented rather than latent.
+// The truncation is pinned rather than narrowed: split-and-take-first is the contract the
+// media-type and cookie rows above depend on, so it cannot be changed for one caller only.
+// The row below pins the truncated value exactly, so the loss is documented rather than
+// latent.
 func TestGetHeaderPartSplitsOnSeparator(t *testing.T) {
 	cases := []struct {
 		name      string

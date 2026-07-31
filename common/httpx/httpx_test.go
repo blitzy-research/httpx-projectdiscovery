@@ -205,9 +205,6 @@ var errUnexpected101BodyRead = errors.New("101 Switching Protocols body was read
 // (common/httpx/mocktransport_test.go) returns the sentinel on first read instead, so the
 // same defect surfaces as an immediate, named error out of Do and the assertion below fails
 // in microseconds.
-//
-// Both existing fixtures and the existing test that uses them are left exactly as they are;
-// this one is purely additional.
 type switchingProtocolsFailFastRoundTripper struct{}
 
 func (switchingProtocolsFailFastRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
