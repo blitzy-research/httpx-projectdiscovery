@@ -143,8 +143,8 @@ func New(options *Options) (*HTTPX, error) {
 		}
 	}
 	transport := &http.Transport{
-		DialContext: httpx.Dialer.Dial,
-		DialTLSContext: httpx.buildTLSDialer(options),
+		DialContext:         httpx.Dialer.Dial,
+		DialTLSContext:      httpx.buildTLSDialer(options),
 		MaxIdleConnsPerHost: -1,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
@@ -282,9 +282,10 @@ get_response:
 	// paths never read it to completion - a capped body, a skipped body read, and a
 	// content-encoding retry that abandons this response - so nothing else would free it.
 	// releaseTransportBody clears the handle after closing it, which keeps the release at
-	// exactly once even when the retry below acquires a second body. When the dump
-	// already closed the body itself, closing it again is a no-op: response bodies are
-	// idempotent closers.
+	// exactly once even when the retry below acquires a second body. Every consumer below
+	// is handed a wrapper rather than this handle - see the read-cap branch and its else -
+	// so the release owns the close outright instead of relying on a second close being
+	// harmless.
 	transportBody := httpresp.Body
 	releaseTransportBody := func() {
 		if transportBody != nil {
@@ -310,6 +311,13 @@ get_response:
 				_ = httpresp.Body.Close()
 			}()
 		}
+	} else {
+		// A non-positive cap skips the limiter above, which would otherwise leave the dump
+		// below holding the transport body itself: the dump closes what it drains before
+		// substituting its in-memory copy, so that body would be closed twice - once there
+		// and once by releaseTransportBody. Wrapping it keeps the release the single owner
+		// of the close without changing a single byte any consumer reads.
+		httpresp.Body = io.NopCloser(httpresp.Body)
 	}
 
 	// httputil.DumpResponse does not handle websockets
