@@ -351,6 +351,18 @@ func TestConnectionStateAfterClose(t *testing.T) {
 // outcome by outcome, so that a change in either direction - a secondary client gaining
 // policy, or the primary losing it - fails here instead of shipping unnoticed.
 //
+// AAP DISPOSITION. That wiring lives in New, at common/httpx/httpx.go:180-204. AAP section
+// 0.8.1.3 authorises exactly two fixes in that file - the configured-cookie reset and the
+// read-cap declared-length guard - and section 0.8.2.1 lists "any change to
+// common/httpx/httpx.go beyond the two documented five-line fixes", explicitly including
+// refactoring and added hooks, as out of scope; the retryablehttp-go half is a pinned
+// dependency, which section 0.8.2.3 forbids changing. Section 0.10.1.1 prescribes the
+// treatment applied here: pin the behaviour, record the divergence, do not fix it. A future
+// engagement authorised to change New should construct both secondary clients from the same
+// policy-aware dialer and transport configuration, install the same CheckRedirect, and apply
+// the resolved proxy - or refuse to expose those paths when the configured policy cannot be
+// enforced; each sub-test below then fails and states the new contract.
+//
 // Hermetic throughout: every origin binds 127.0.0.1, the proxy that is configured is a
 // closed loopback port, and no name outside the loopback interface is ever resolved.
 

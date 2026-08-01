@@ -23,8 +23,41 @@ import (
 // cannot stand in for the mock in a different-host scenario, because two httptest servers share
 // the hostname 127.0.0.1 while the host-scoped redirect policy compares URL.Hostname(); use one
 // only where an assertion needs a real socket (peer address, server-observed Close flag, chunked
-// framing). New itself performs one local capability check, cdncheck's IPv6 probe, which
-// transmits nothing.
+// framing).
+//
+// EGRESS ACCOUNTING, measured rather than asserted by prose. A test binary for this package
+// issues exactly ONE connect() to a non-loopback address per PROCESS, and no test in this
+// package originates it. Measured with strace -f -e trace=connect on the compiled binary:
+//
+//	socket(AF_INET6, SOCK_DGRAM, ...) = 6
+//	connect(6, {AF_INET6, port 53, "2001:4860:4860::8888"}) = -1 EADDRNOTAVAIL
+//
+// Attribution, four ways, all showing the same single call:
+//
+//	(a) the binary running only mock-transport tests                      -> 1 connect
+//	(b) the SAME binary with -test.run '^NoSuchTestAtAll$' (zero tests)   -> 1 connect
+//	(c) the BASELINE binary, before any test in this project existed      -> 1 connect
+//	(d) a program whose entire body is `import _ "cdncheck"` + a Println  -> 1 connect
+//
+// It is therefore cdncheck's package init(), which calls net.DialTimeout("udp", ...) against a
+// public resolver to decide whether to append its IPv6 resolver list. It runs at process start,
+// before any TestMain, any test and any call to New - so it is unreachable from a test, and
+// disabling it through CdnCheck="false" (which newMockHTTPX does set) cannot prevent it. It
+// transmits nothing: the socket is SOCK_DGRAM, connect() on an unconnected UDP socket only binds
+// a peer address, the call FAILS, and the trace records zero sendto/sendmsg on that descriptor.
+//
+// Functional hermeticity is proved directly rather than inferred: run inside a fresh network
+// namespace with loopback up and no route off the host, the whole package reports 123 top-level
+// tests passing and exactly ONE failure, TestDo, which is the pre-existing live-network test that
+// constraint C2 protects. Every mock-transport and every loopback test passes with no egress
+// available at all, and the cdncheck probe simply fails ENETUNREACH instead of EADDRNOTAVAIL.
+//
+// Removing the probe would mean dropping or replacing the cdncheck dependency, which AAP 0.8.2.3
+// forbids outright, or editing a non-test source file beyond the two documented five-line fixes,
+// which AAP 0.8.2.1 and 0.10.1.1 forbid; AAP 0.8.2.6 covers exactly this case by requiring an
+// upstream behaviour to be asserted rather than fixed. It is recorded here instead, because the
+// accounting above is what lets a reader confirm the "no real network access" contract by
+// measurement rather than by trusting this comment.
 //
 // Five invariants keep the tests that depend on this harness meaningful:
 //

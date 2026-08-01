@@ -239,7 +239,7 @@ func TestRedirectMaxRedirectsBudget(t *testing.T) {
 // authorise by naming -fhr: a different port on the same name, which is a different service,
 // and a different scheme on the same name, which is a downgrade to cleartext carrying
 // whatever credential state the hop inherited. The cleartext case and its exact headers are
-// pinned separately by assertRedirectFollowHostRedirectsAllowsCleartextDowngrade.
+// pinned separately by TestRedirectFollowHostRedirectsAllowsCleartextDowngrade.
 //
 // The comparison is pinned rather than tightened: comparing the full origin would stop following
 // hops that -fhr follows today, changing the result set of every scan that uses the flag. The rows
@@ -361,9 +361,10 @@ func TestRedirectFollowHostRedirectsComparesHostnameOnly(t *testing.T) {
 		})
 	}
 
-	// The security consequence of comparing the hostname alone: a scheme change is
-	// admitted, so an https target can be walked down to cleartext on the same host.
-	t.Run("hostname match admits an https to http downgrade", assertRedirectFollowHostRedirectsAllowsCleartextDowngrade)
+	// The security consequence of comparing the hostname alone - a scheme change is admitted,
+	// so an https target can be walked down to cleartext on the same host - is asserted by
+	// TestRedirectFollowHostRedirectsAllowsCleartextDowngrade, which is declared at the top
+	// level so its own name selects it.
 }
 
 // TestRedirectMethodAndBodyRewriting verifies net/http's behavior for this POST: 301,
@@ -483,13 +484,13 @@ func TestRedirectMethodAndBodyRewriting(t *testing.T) {
 		})
 	}
 
-	// The same 307 method-and-body contract observed per DESTINATION rather than per
-	// status code, which is what decides whether a credential crosses with the payload.
-	t.Run("a 307 carries the method body and headers to whichever destination Location names", assertRedirectCrossOriginForwardsSecretsAndBody)
-
-	// The same contract observed against the OTHER discriminator net/http applies: not
-	// which status was returned, but whether the request can reproduce its body at all.
-	t.Run("a 307 or 308 is followed only when the body is rewindable", assertRedirect307308ReplayRequiresRewindableBody)
+	// The same 307 method-and-body contract observed per DESTINATION rather than per status
+	// code - which is what decides whether a credential crosses with the payload - is asserted
+	// by TestRedirectCrossOriginForwardsSecretsAndBody, and the same contract observed against
+	// the OTHER discriminator net/http applies - not which status was returned, but whether the
+	// request can reproduce its body at all - by
+	// TestRedirectRunnerConstructedBodyIsNotReplayedOn307308. Both are declared at the top
+	// level so their own names select them.
 }
 
 // TestRedirectSetsRefererPerHop verifies that each synthesized Referer names the
@@ -545,9 +546,10 @@ func TestRedirectSetsRefererPerHop(t *testing.T) {
 	require.Equal(t, []int{http.StatusFound, http.StatusFound, http.StatusOK}, resp.GetChainStatusCodes())
 	require.Equal(t, "http://origin.example/c", resp.GetChainLastURL())
 
-	// Position in the chain decides the Referer above; confidentiality decides it once
-	// the hop crosses an origin or drops to cleartext.
-	t.Run("cross origin and downgrade hops decide the Referer by confidentiality", assertRedirectRefererCrossOriginConfidentiality)
+	// Position in the chain decides the Referer above; once the hop crosses an origin or drops
+	// to cleartext, confidentiality decides it instead, which
+	// TestRedirectRefererCrossOriginConfidentiality asserts. It is declared at the top level so
+	// its own name selects it.
 }
 
 // TestRedirectRespectHSTSUpgradesScheme verifies this client's RespectHSTS behavior:
@@ -700,7 +702,7 @@ const (
 	redirectSentinelReferer     = "http://origin.example/start"
 )
 
-// assertRedirectCrossOriginForwardsSecretsAndBody records a 307 redirect to an unrelated
+// TestRedirectCrossOriginForwardsSecretsAndBody records a 307 redirect to an unrelated
 // origin, a subdomain, and the original origin. net/http strips its enumerated
 // sensitive headers only when shouldCopyHeaderOnRedirect rejects the destination, but
 // preserves non-enumerated headers and replays a rewindable 307 body. The client's
@@ -717,8 +719,12 @@ const (
 // names would change client behaviour, so the divergence is instead stated as an exact per-hop
 // value here: it cannot widen or silently narrow without failing.
 //
-// It runs as a sub-test of TestRedirectMethodAndBodyRewriting: the 307 method-and-body contract
-// that test sweeps by status code is the same contract examined here per destination.
+// It is the per-destination counterpart of TestRedirectMethodAndBodyRewriting: the 307
+// method-and-body contract that test sweeps by status code is the same contract examined here
+// per destination. It is declared at the top level, rather than folded into that test as a
+// sub-test, so that the selector naming it runs the scenario instead of matching nothing:
+// go test -run selects top-level names, and a security scenario reachable only through its
+// parent's name is a scenario a reader can silently fail to execute.
 //
 // SECURITY DISPOSITION. Two of the outcomes below are credential and payload disclosure to a host
 // the operator never named: the non-sensitive secret header reaches every destination including
@@ -737,7 +743,19 @@ const (
 //
 // An exact per-hop assertion is what keeps both bounded: the disclosure cannot widen, and cannot
 // silently narrow either, without failing here.
-func assertRedirectCrossOriginForwardsSecretsAndBody(t *testing.T) {
+//
+// AAP DISPOSITION. Withholding a non-enumerated credential header, or refusing to replay a body
+// to a different origin, is a redirect-policy change in common/httpx/httpx.go (a CheckRedirect
+// that rewrites the outgoing header set) or in net/http itself. AAP section 0.4.5.4 lists "a
+// custom auth header survives a cross-origin redirect" among the divergences deliberately NOT
+// fixed ("standard-library redirect policy, not this repository's code"), section 0.8.2.6 puts
+// upstream and standard-library behaviour in the "asserted, not fixed" category, and section
+// 0.8.2.1 places any further change to httpx.go out of scope. Section 0.10.1.1 prescribes the
+// treatment used here: pin the behaviour, record the divergence. A future engagement authorised
+// to change the policy should strip non-allowlisted credential headers on an origin change and
+// require an explicit opt-in before replaying a body there; these rows then fail and state the
+// new contract.
+func TestRedirectCrossOriginForwardsSecretsAndBody(t *testing.T) {
 	require.Len(t, redirectSentinelBody, 21, "precondition: the sentinel payload is exactly 21 bytes")
 
 	cases := []struct {
@@ -916,15 +934,18 @@ const (
 	redirectSentinelSecureTarget    = "https://other.example/collect"
 )
 
-// assertRedirectRefererCrossOriginConfidentiality records the Referer received after
+// TestRedirectRefererCrossOriginConfidentiality records the Referer received after
 // cross-origin and HTTPS-to-HTTP redirects. net/http suppresses a synthesized Referer
 // on HTTPS-to-HTTP, preserves an explicit Referer, and otherwise strips URL userinfo
 // while retaining path, query, and fragment. AutoReferer supplies an explicit value
 // before Do, so the table distinguishes synthesized and explicit behavior.
 //
-// It runs as a sub-test of TestRedirectSetsRefererPerHop, which establishes the per-hop
-// Referer contract on a same-origin chain; this extends the same subject to the cases
-// where confidentiality decides the value instead of position in the chain.
+// It extends TestRedirectSetsRefererPerHop, which establishes the per-hop Referer contract on
+// a same-origin chain, to the cases where confidentiality decides the value instead of position
+// in the chain. It is declared at the top level, rather than folded into that test as a
+// sub-test, so that the selector naming it runs the scenario instead of matching nothing:
+// go test -run selects top-level names, and a security scenario reachable only through its
+// parent's name is a scenario a reader can silently fail to execute.
 //
 // SECURITY DISPOSITION. The AutoReferer rows record a real disclosure: SetCustomHeaders installs
 // the Referer as r.String(), the caller's target URL in full, so a URL that carries userinfo, a
@@ -939,7 +960,17 @@ const (
 // dropping the query and fragment, or deferring to net/http's synthesis - would change the Referer
 // every -auto-referer scan emits. Pinning the exact value each destination receives is what keeps
 // it bounded: it cannot grow, and it cannot be closed unnoticed either.
-func assertRedirectRefererCrossOriginConfidentiality(t *testing.T) {
+//
+// AAP DISPOSITION. Both halves of this finding require a non-test source change. The synthesized
+// value belongs to net/http's refererForURL, which section 0.8.2.6 of the AAP puts in the
+// "asserted, not fixed" category; the explicit value is installed by
+// common/httpx/httpx.go:517-519, and section 0.8.2.1 places any change to that file beyond the
+// two documented fixes out of scope, with section 0.10.1.1 prescribing the pin-and-record
+// treatment used here. -auto-referer additionally defaults to false. A future engagement
+// authorised to change SetCustomHeaders should build the header from a sanitised URL - userinfo
+// removed, query and fragment dropped - and keep the HTTPS-to-HTTP suppression; the explicit-value
+// rows below then fail and state the new contract.
+func TestRedirectRefererCrossOriginConfidentiality(t *testing.T) {
 	cases := []struct {
 		name     string
 		start    string
@@ -1090,15 +1121,18 @@ func assertRedirectRefererCrossOriginConfidentiality(t *testing.T) {
 	}
 }
 
-// assertRedirectFollowHostRedirectsAllowsCleartextDowngrade shows that hostname-only
+// TestRedirectFollowHostRedirectsAllowsCleartextDowngrade shows that hostname-only
 // matching admits HTTPS-to-HTTP redirects on the same hostname, including port changes.
 // net/http suppresses Referer on the downgrade but preserves the enumerated credential
 // headers because the destination remains host-related, while the configured cookie is
 // re-applied by the injector. The test records the cleartext hop and its exact headers.
 //
-// It runs as a sub-test of TestRedirectFollowHostRedirectsComparesHostnameOnly, whose
-// table establishes that the closure ignores scheme and port; this is the security
-// consequence of that same comparison, so it belongs under the same subject.
+// It is the security counterpart of TestRedirectFollowHostRedirectsComparesHostnameOnly,
+// whose table establishes that the closure ignores scheme and port; this test states the
+// consequence of that same comparison. It is declared at the top level, rather than folded
+// into that table as a sub-test, so that the selector naming it runs the scenario instead of
+// matching nothing: go test -run selects top-level names, and a security scenario reachable
+// only through its parent's name is a scenario a reader can silently fail to execute.
 //
 // SECURITY DISPOSITION. This is the sharpest edge of the hostname-only comparison: a bearer
 // token supplied for an https target is transmitted over cleartext on the downgraded hop,
@@ -1110,7 +1144,18 @@ func assertRedirectRefererCrossOriginConfidentiality(t *testing.T) {
 // The downgrade is pinned rather than refused, on the same grounds as the parent test: refusing it
 // means changing which hops -fhr follows for every user. The exact assertion below states in one
 // place that the token appears in the clear, so the behaviour is documented rather than latent.
-func assertRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
+//
+// AAP DISPOSITION. Tightening the comparison to a full origin (RFC 9110 section 4.3.1), or
+// refusing a secure-to-cleartext hop, is a change to the redirect closure in
+// common/httpx/httpx.go:116-143. AAP section 0.4.5.4 lists "host-scoping compares hostname
+// only, ignoring port and scheme" among the divergences deliberately NOT fixed ("deliberate
+// scanner behavior; changing it would alter results for every user"), and section 0.8.2.1
+// places "any change to common/httpx/httpx.go beyond the two documented five-line fixes" out
+// of scope; section 0.10.1.1 prescribes exactly what this test does instead - pin the current
+// behaviour and record the divergence. A future engagement that is authorised to change the
+// closure should compare scheme, hostname and effective port, and strip inherited credentials
+// on a downgrade; this test then fails and states the new contract.
+func TestRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
 	const secureStart = "https://origin.example/private"
 
 	cases := []struct {
@@ -1194,7 +1239,7 @@ func assertRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
 				hops[1].Header.Get("Cookie"),
 				"the configured cookie reaches the cleartext hop: the injector re-applies it on every admitted hop, exactly once, whatever the scheme")
 			require.NotContains(t, hops[1].Header.Get("Cookie"), redirectSentinelSessionCookie,
-				"the inherited session cookie does not reach the cleartext hop: net/http copied it because the hostname matched, and the injector's unconditional Header.Del then discarded it - the same pinned divergence assertRedirectCrossOriginForwardsSecretsAndBody documents")
+				"the inherited session cookie does not reach the cleartext hop: net/http copied it because the hostname matched, and the injector's unconditional Header.Del then discarded it - the same pinned divergence TestRedirectCrossOriginForwardsSecretsAndBody documents")
 			require.Equal(t, redirectSentinelAPIKey, hops[1].Header.Get(redirectSentinelAPIKeyHeader),
 				"the bespoke secret header is copied onto the cleartext hop as well")
 
@@ -1216,7 +1261,7 @@ func assertRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
 	}
 }
 
-// assertRedirect307308ReplayRequiresRewindableBody pins net/http's documented rule for
+// TestRedirectRunnerConstructedBodyIsNotReplayedOn307308 pins net/http's documented rule for
 // body-preserving redirects: at client.go:531 a 307 or 308 is followed only when the
 // original request can reproduce its body, which the standard library decides by testing
 // GetBody != nil whenever outgoingLength() is non-zero. When that test fails the library
@@ -1236,14 +1281,24 @@ func assertRedirectFollowHostRedirectsAllowsCleartextDowngrade(t *testing.T) {
 // the 3xx instead of the destination. Closing that requires the caller to supply a rewindable body,
 // which is a change to the runner rather than to these tests.
 //
-// It runs as a sub-test of TestRedirectMethodAndBodyRewriting, whose table states the
-// per-status method-and-body rewriting contract; this extends the same subject to the
-// question of whether the payload can be reproduced at all.
+// It extends TestRedirectMethodAndBodyRewriting, whose table states the per-status
+// method-and-body rewriting contract, to the question of whether the payload can be reproduced
+// at all. It is declared at the top level, rather than folded into that test as a sub-test, so
+// that the selector naming it runs the scenario instead of matching nothing: go test -run
+// selects top-level names, and a security scenario reachable only through its parent's name is a
+// scenario a reader can silently fail to execute. The name states the security-relevant half -
+// a runner-constructed, non-rewindable body is NOT replayed on a 307 or 308 - while the table
+// also carries the rewindable control rows that make that half meaningful.
 //
 // The assertions describe only the net/http contract and the request the test itself
 // builds, so any caller in this repository that starts supplying a rewindable body simply
 // matches the rewindable rows below.
-func assertRedirect307308ReplayRequiresRewindableBody(t *testing.T) {
+//
+// AAP DISPOSITION. The remedy is in the caller, not here: the runner would have to attach its
+// payload through a constructor that installs GetBody. runner/** is outside the AAP writable set
+// entirely (section 0.8.1 lists twelve paths, all under common/httpx), so this engagement pins
+// the behaviour and records it per section 0.10.1.1.
+func TestRedirectRunnerConstructedBodyIsNotReplayedOn307308(t *testing.T) {
 	const parityPayload = "payload"
 	require.Len(t, parityPayload, 7, "precondition: the request payload is exactly 7 bytes")
 

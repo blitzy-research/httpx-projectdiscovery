@@ -228,9 +228,10 @@ func TestChainAccessorsMultiHop(t *testing.T) {
 			"the chain's RequestURL sequence must match the requests the transport really saw")
 	})
 
-	// The same accessor surface, driven with a credential-bearing target, where Location
-	// resolution decides whether the credential reaches caller-visible output.
-	t.Run("a credential in the target URL reaches the accessors when Location is relative", assertChainRetainsURLUserinfoInCallerVisibleOutput)
+	// The same accessor surface driven with a credential-bearing target, where Location
+	// resolution decides whether the credential reaches caller-visible output, is asserted by
+	// TestChainRetainsURLUserinfoInCallerVisibleOutput. It is declared at the top level so its
+	// own name selects it.
 }
 
 // TestChainGetChainOmitsFirstRequestAndLastResponse verifies GetChain's loop contract:
@@ -380,9 +381,9 @@ func TestChainDumpsCarryNoBody(t *testing.T) {
 			"the concatenated chain dump must stay body-free as well, including "+marker)
 	}
 
-	// The dumps carry no body, but they do carry every header verbatim - the other half
-	// of what the dump bytes contain.
-	t.Run("the dumps retain request and response headers verbatim", assertChainDumpsExposeSensitiveHeaders)
+	// The dumps carry no body, but they do carry every header verbatim - the other half of what
+	// the dump bytes contain, asserted by TestChainDumpsExposeSensitiveHeaders. It is declared at
+	// the top level so its own name selects it.
 }
 
 // TestChainRedirectHopsDumpProtoZero verifies that the original request dump carries
@@ -528,14 +529,18 @@ const (
 		chainSecretResponseHeader + ": " + chainSecretResponseValue + "\r\n\r\n"
 )
 
-// assertChainDumpsExposeSensitiveHeaders verifies that same-origin chain dumps retain
+// TestChainDumpsExposeSensitiveHeaders verifies that same-origin chain dumps retain
 // request credentials and response headers verbatim. GetChain is written by StoreChain,
 // while GetChainAsSlice populates JSON chain output; neither accessor redacts upstream
 // dump bytes. Same-origin routing isolates chain serialization from cross-origin header
 // stripping.
 //
-// It runs as a sub-test of TestChainDumpsCarryNoBody: both examine exactly what the dump
-// bytes do and do not contain, one for payload bytes and one for header values.
+// It is the credential-bearing counterpart of TestChainDumpsCarryNoBody: both examine exactly
+// what the dump bytes do and do not contain, one for payload bytes and one for header values. It
+// is declared at the top level, rather than folded into that test as a sub-test, so that the
+// selector naming it runs the scenario instead of matching nothing: go test -run selects
+// top-level names, and a security scenario reachable only through its parent's name is a scenario
+// a reader can silently fail to execute.
 //
 // SECURITY DISPOSITION. The consequence is a credential at rest, not on the wire: the chain is
 // written into the runner's -store-chain files and into its JSON output, so an Authorization,
@@ -547,7 +552,17 @@ const (
 // change the content of every stored chain, so the exposure is pinned instead: the assertions below
 // state exactly which values a dump carries, and any change to that, in either direction, fails
 // here.
-func assertChainDumpsExposeSensitiveHeaders(t *testing.T) {
+//
+// AAP DISPOSITION. The dump bytes are produced by pdhttputil.GetChain, a pinned dependency, and
+// surfaced by common/httpx/response.go:62-109. response.go is not in the AAP writable set at all -
+// section 0.8.1.3 authorises exactly two fixes in common/httpx/httpx.go and nothing else, and
+// section 0.8.2.1 lists every other source file as out of scope - while section 0.8.2.6 puts
+// upstream behaviour in the "asserted, not fixed" category. Section 0.10.1.1 prescribes the
+// pin-and-record treatment applied here. A future engagement authorised to change the accessors
+// should redact credential headers and URL userinfo before returning or storing chain data, and
+// keep the raw form behind an explicitly unsafe diagnostic option; these assertions then fail and
+// state the new contract.
+func TestChainDumpsExposeSensitiveHeaders(t *testing.T) {
 	// Two hops on ONE origin. Same-origin is deliberate: it removes net/http's
 	// cross-origin stripping from the picture entirely, so what the dumps contain is
 	// attributable to the chain builder alone rather than to redirect header policy,
@@ -656,7 +671,7 @@ func assertChainDumpsExposeSensitiveHeaders(t *testing.T) {
 	require.Equal(t, []int{http.StatusMovedPermanently, http.StatusOK}, resp.GetChainStatusCodes())
 	require.True(t, resp.HasChain())
 	require.Equal(t, chainTargetB, resp.GetChainLastURL(),
-		"the final URL is the plain target here; the credential-bearing case is assertChainRetainsURLUserinfoInCallerVisibleOutput")
+		"the final URL is the plain target here; the credential-bearing case is TestChainRetainsURLUserinfoInCallerVisibleOutput")
 	require.Equal(t, chainTargetB, slice[0].Location, "the resolved Location of the first hop")
 	require.Equal(t, "", slice[1].Location, "the terminal hop has no Location")
 	require.Equal(t, chainTargetA, slice[0].RequestURL)
@@ -676,16 +691,19 @@ const (
 	chainPlainFinal    = "http://origin.example/final"
 )
 
-// assertChainRetainsURLUserinfoInCallerVisibleOutput compares relative and absolute
+// TestChainRetainsURLUserinfoInCallerVisibleOutput compares relative and absolute
 // redirect Locations for a target containing URL userinfo. A relative Location inherits
 // the base URL's userinfo, so the resolved Location, follow-up RequestURL, final URL, and
 // derived Basic header retain it; an absolute Location without userinfo does not. The
 // first chain item still records the original credential-bearing URL and request dump.
 // net/http strips userinfo from the synthesized Referer, providing a control.
 //
-// It runs as a sub-test of TestChainAccessorsMultiHop, which establishes what the
-// accessors report for a plain chain; this pins what they report when the target URL
-// carries a credential, which is the same accessor surface under a different input.
+// It extends TestChainAccessorsMultiHop, which establishes what the accessors report for a plain
+// chain, to what they report when the target URL carries a credential - the same accessor surface
+// under a different input. It is declared at the top level, rather than folded into that test as a
+// sub-test, so that the selector naming it runs the scenario instead of matching nothing:
+// go test -run selects top-level names, and a security scenario reachable only through its
+// parent's name is a scenario a reader can silently fail to execute.
 //
 // SECURITY DISPOSITION. The row-invariant result is the finding: whatever the Location says,
 // chain item 0 always records the caller's own credential-bearing URL, so a password supplied
@@ -697,7 +715,12 @@ const (
 // alter output every consumer parses. The two rows pin the exposure exactly - including the control
 // that net/http DOES strip userinfo from the synthesized Referer, which is what shows the retention
 // is the chain's behaviour and not the protocol's.
-func assertChainRetainsURLUserinfoInCallerVisibleOutput(t *testing.T) {
+//
+// AAP DISPOSITION. Identical to TestChainDumpsExposeSensitiveHeaders: the remedy lives in
+// common/httpx/response.go and in the pinned pdhttputil chain builder, neither of which this
+// engagement may modify (AAP sections 0.8.1.3, 0.8.2.1 and 0.8.2.6), so section 0.10.1.1's
+// pin-and-record treatment applies.
+func TestChainRetainsURLUserinfoInCallerVisibleOutput(t *testing.T) {
 	cases := []struct {
 		name string
 		// scriptedLocation is the ONLY difference between the two rows.

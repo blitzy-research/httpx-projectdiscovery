@@ -301,6 +301,39 @@ func TestDoBodyReadCapTruncatesOversizeBody(t *testing.T) {
 	//
 	// The positive-cap row is therefore both the control for the byte counts and the pin for
 	// the unreleased body.
+	//
+	// AAP DISPOSITION - the unreleased body is pinned here, deliberately NOT fixed.
+	// The wantCloses:0 row records a genuine resource-lifecycle defect: the limiting branch
+	// in Do wraps the transport body in io.NopCloser, which DISCARDS the original Closer, so
+	// the branch's own deferred drain-and-close reaches only the no-op wrapper and the body
+	// the transport handed over is never released. The remedy is a three-line change in that
+	// branch - retain the original ReadCloser and close IT rather than the wrapper - and it
+	// is out of scope:
+	//   - AAP 0.8.1.3 makes common/httpx/httpx.go writable for exactly TWO documented
+	//     changes, five lines in total: FIX-1's req.Header.Del("Cookie") in setCustomCookies
+	//     and FIX-2's ContentLength = -1 guard in this very read-cap branch. A third change
+	//     to the same branch is not one of them.
+	//   - AAP 0.8.2.1 names "Any change to common/httpx/httpx.go beyond the two documented
+	//     five-line fixes" as explicitly out of scope, and forbids refactoring for
+	//     testability, extracting seams, or adding hooks - which is what retaining the
+	//     original closer past the wrap amounts to.
+	//   - AAP 0.10.1.1 states the required behaviour verbatim: "If an implementing agent
+	//     believes a third bug exists, the required behavior is: pin the current behavior in
+	//     a test, document the divergence in the completion summary, and do NOT fix it."
+	// This is not a hypothetical boundary. The fix was written once during this project and
+	// then removed precisely because it breached that boundary: commit 0551435 carried a
+	// third httpx.go change, and 86e17e2 ("restore the AAP source boundary") reverted it,
+	// leaving httpx.go at exactly +6/-0 against the base commit. Re-applying it here would
+	// undo that reconciliation.
+	//
+	// The pin is therefore the deliverable, and it is exact in BOTH directions: wantCloses is
+	// an equality, not a lower bound, so a future release that starts closing the transport
+	// body (1) or that double-closes it (2) fails this row and forces a deliberate decision
+	// rather than silently changing the connection lifecycle. The blast radius of the current
+	// behaviour is bounded by the scanner's own transport configuration, which sets
+	// DisableKeepAlives and MaxIdleConnsPerHost:-1 (pinned by
+	// TestTransportDisablesConnectionReuse): the connection is not returned to an idle pool,
+	// so an unreleased body cannot accumulate as reusable-but-poisoned pooled connections.
 	t.Run("a non positive cap disables the cap", func(t *testing.T) {
 		// A recognizable 10-byte prefix, so a bounded read is proved to have kept the
 		// START of the body rather than some 64 bytes from elsewhere in it.

@@ -2,10 +2,12 @@ package httpx
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -542,4 +544,238 @@ func TestTimeoutContextVariantParity(t *testing.T) {
 		"both constructor variants must have produced an outcome to compare")
 	require.Equal(t, outcomes[0], outcomes[1],
 		"the context-free and context-bearing constructors must produce identical observable outcomes")
+}
+
+// Sentinels for the disclosure pin below. They are deliberately NOT credentials: the whole
+// point of the pin is to establish WHICH URL components a failure renders into the error a
+// caller receives and logs, and establishing that with a real secret would put the secret in
+// the very CI log the finding is about (CWE-532). Each component therefore carries a value
+// that is unmistakable in a haystack yet worthless if disclosed, and every assertion below is
+// written as an occurrence COUNT rather than a substring containment, so a failure prints
+// "expected: 2, actual: 0" instead of echoing the URL it was searching.
+const (
+	// disclosureHost is a synthetic authority that exists only inside the scripted
+	// transport. url.URL keeps credentials in User, so Host holds only host[:port] and is
+	// safe to render - which is exactly why the harness retains it when redacting.
+	disclosureHost = "http://origin.example"
+
+	// disclosurePathSecret stands in for a capability token carried in the PATH, the shape
+	// a password-reset or pre-signed-download probe takes. It is entirely alphanumeric and
+	// short, which is why no character or length heuristic can classify a path as
+	// credential-free.
+	disclosurePathSecret = "P4THT0KEN"
+
+	// disclosureQuerySecret stands in for an API key carried in the QUERY, the shape a
+	// "?apikey=" or "?access_token=" probe takes.
+	disclosureQuerySecret = "QU3RYK3Y"
+
+	// disclosureFragment stands in for a fragment, which is never transmitted on the wire
+	// (RFC 9110 7.1) and so is the component a reader would LEAST expect in an error.
+	disclosureFragment = "FR4GM3NT"
+
+	// disclosureUserinfoUser and disclosureUserinfoSecret stand in for URL userinfo. The
+	// password sentinel is the one value the pin proves is rendered in CLEARTEXT, so it is
+	// only ever counted, never printed.
+	disclosureUserinfoUser   = "us3r"
+	disclosureUserinfoSecret = "P4SSW0RD"
+)
+
+// TestDoErrorDisclosesRequestURLComponents pins, component by component, exactly what the
+// error returned by Do renders about the target of a failed request - the caller-visible
+// surface that a scanner writes to its own log, to stderr and to any aggregator downstream.
+//
+// Why this is a protocol-visible outcome and not an implementation detail: the returned error
+// IS part of the client's contract. A caller cannot choose a narrower rendering, because the
+// string is composed before Do returns; whatever it contains has already escaped. The two
+// rows below therefore assert the two renderings independently, because they are produced by
+// two different layers with two different redaction policies, and the difference is the whole
+// finding:
+//
+//   - The OUTER prefix comes from retryablehttp-go, which formats
+//     "METHOD <raw request URL> giving up after N attempts: %w" using the request URL
+//     VERBATIM. It performs no redaction whatsoever, so URL userinfo appears with the
+//     password in cleartext.
+//   - The INNER cause is net/http's *url.Error, whose Error method renders the URL through
+//     url.URL.Redacted(), which replaces the password with "***" while leaving the username,
+//     path, query and fragment untouched.
+//
+// The net effect asserted here: path, query and fragment are disclosed TWICE, the username
+// TWICE, and the password ONCE in cleartext plus once redacted. Both counts matter. A reader
+// who knows only that net/http redacts passwords would conclude the credential is protected;
+// the outer prefix is what defeats that, and it can only be seen by counting both renderings
+// in the same string.
+//
+// Row 2 additionally pins the second half of the finding, which is the more alarming half: the
+// credential is not stripped BEFORE the round trip either. net/http removes userinfo only when
+// it serializes the request target, converting it into a Basic Authorization header at that
+// point, so the *url.URL handed to every round tripper - and therefore to any proxy hook or
+// transport-level logger a caller installs - still carries the cleartext password. That is
+// asserted from the recorded snapshot alongside the serialized-target contrast, and it is the
+// reason this package's own harness redacts before rendering anything at all.
+//
+// Row 1 carries no userinfo, so the harness's invariant-5 tripwire stays quiet by
+// construction and the row can drive a genuinely failing round trip. Row 2 needs userinfo on
+// a failing request, which is precisely the combination the tripwire reports, so it drives a
+// transport built directly rather than through newMockTransport - the test that establishes
+// what the tripwire is FOR must not be subject to it - and then asserts the tripwire fired
+// and that its retained evidence is credential-free. That makes Row 2 a pin of the leak and a
+// pin of the harness guard in one, with nothing sensitive retained either way.
+//
+// AAP DISPOSITION - the disclosure is pinned here, deliberately NOT fixed. The cleartext
+// rendering originates in the pinned dependency github.com/projectdiscovery/retryablehttp-go
+// v1.3.18, which builds the prefix from the raw URL; the partial redaction originates in the
+// Go standard library's net/url. Neither is this repository's code:
+//   - AAP 0.8.2.6 states that upstream and standard-library defects are "ASSERTED, NOT
+//     FIXED", and names URL-component handling in the pinned utils module and the standard
+//     library's own redirect header-copy policy as the two worked examples of exactly this
+//     situation.
+//   - AAP 0.8.2.3 forbids adding, upgrading, downgrading or removing any dependency, so the
+//     upstream formatter cannot be replaced or patched, and go.sum must stay at 578 lines.
+//   - AAP 0.8.2.1 and 0.10.1.1 confine non-test edits to the two documented five-line fixes
+//     in httpx.go, so wrapping or re-rendering the error inside Do - the only in-repository
+//     remedy - is out of scope. 0.10.1.1 states the required behaviour verbatim: pin the
+//     current behavior in a test, document the divergence, and do NOT fix it.
+//
+// The remediation a future, in-scope change would apply, recorded so it is actionable: have Do
+// re-render the error it returns through url.URL.Redacted() applied to a URL whose User is
+// cleared outright, rather than surfacing the retryablehttp string unchanged - which would
+// close the cleartext-password path and the username path together. Closing the path, query
+// and fragment paths additionally requires a size-only rendering of those components, the
+// policy this package's own test harness already implements in redactedURL.
+func TestDoErrorDisclosesRequestURLComponents(t *testing.T) {
+	// The suffix every row shares: a credential-bearing path segment, a credential-bearing
+	// query parameter and a fragment. Built once so the two rows differ ONLY in userinfo.
+	targetSuffix := "/reset/" + disclosurePathSecret + "?apikey=" + disclosureQuerySecret + "#" + disclosureFragment
+
+	// transportFailure is the cause both rows inject. It is a plain error from the round
+	// tripper rather than a timeout, so the rendering under test is the one produced for
+	// ANY transport failure - a refused connection, a reset, a handshake failure - and not
+	// an artifact of the deadline paths pinned above.
+	transportFailure := errors.New("disclosure fixture: the transport refused the connection")
+
+	t.Run("path query and fragment are rendered twice with no userinfo present", func(t *testing.T) {
+		rt := newMockTransport(t, func(r *http.Request) (*http.Response, error) {
+			return nil, transportFailure
+		})
+		ht := newMockHTTPX(t, nil, rt)
+
+		target := disclosureHost + targetSuffix
+		req, err := retryablehttp.NewRequest(http.MethodGet, target, nil)
+		require.NoError(t, err)
+
+		resp, err := ht.Do(req, UnsafeOptions{})
+		require.Nil(t, resp, "a transport failure must produce no response, so the error is the caller's only output")
+		require.Error(t, err, "the fixture fails the round trip, so an error is required for the rendering to exist")
+		rendered := err.Error()
+
+		// The cause is preserved, which is what makes the rendering diagnostic and is the
+		// reason the URL is there at all. Asserted first so a fixture that failed for some
+		// other reason cannot make the counts below pass vacuously.
+		require.Equal(t, 1, strings.Count(rendered, transportFailure.Error()),
+			"the injected cause must appear exactly once, so the rendering under test is the one produced for this failure")
+		require.Equal(t, 1, strings.Count(rendered, "giving up after 1 attempts"),
+			"the retry layer's exhaustion wrapper must be present exactly once, which is what puts the raw URL in front of the cause")
+
+		// The finding proper: each component appears TWICE, once in retryablehttp's raw
+		// prefix and once in net/http's redacted *url.Error. Exact counts, so a change that
+		// closed one rendering and not the other is a failure here rather than a silent
+		// half-fix.
+		require.Equal(t, 2, strings.Count(rendered, disclosurePathSecret),
+			"a capability token in the PATH is rendered by both layers: retryablehttp's raw prefix and url.Error's redacted form, which redacts only the password")
+		require.Equal(t, 2, strings.Count(rendered, "apikey="+disclosureQuerySecret),
+			"an API key in the QUERY is rendered by both layers verbatim, key and value together")
+		require.Equal(t, 2, strings.Count(rendered, disclosureFragment),
+			"the FRAGMENT is rendered by both layers even though RFC 9110 7.1 keeps it off the wire entirely, so it never reached the origin and is disclosed by the client alone")
+
+		// Neither rendering is a truncation or a summary: the whole absolute target is
+		// present, twice, exactly as the caller supplied it.
+		require.Equal(t, 2, strings.Count(rendered, target),
+			"both renderings carry the complete absolute target, so no component was elided by either layer")
+
+		// The request still reached the transport exactly once, which fixes WHERE the
+		// rendering came from: the failure is the round trip's, not a construction error.
+		require.Equal(t, 1, rt.callCount(), "the fixture must fail at the transport, so exactly one round trip is accounted for")
+		hops := rt.requests()
+		require.Len(t, hops, 1)
+		require.Equal(t, target, hops[0].URL,
+			"the snapshot is r.URL.String(), so the URL the round tripper observed is the caller's target in full - fragment included, because net/http drops the fragment only when it SERIALIZES the request target, which TestNewRequestURLEncoding pins separately")
+	})
+
+	t.Run("url userinfo is rendered once in cleartext and once redacted", func(t *testing.T) {
+		// Built directly rather than through newMockTransport: this row drives exactly the
+		// userinfo-plus-transport-error combination that requireNoUserinfoErrorLeaks
+		// reports, and the test that establishes what that tripwire is FOR cannot be
+		// subject to it. The tripwire is asserted below instead of being registered.
+		rt := &mockTransport{handler: func(r *http.Request) (*http.Response, error) {
+			return nil, transportFailure
+		}}
+		ht := newMockHTTPX(t, nil, rt)
+
+		credentialed := "http://" + disclosureUserinfoUser + ":" + disclosureUserinfoSecret + "@origin.example" + targetSuffix
+		req, err := retryablehttp.NewRequest(http.MethodGet, credentialed, nil)
+		require.NoError(t, err)
+
+		resp, err := ht.Do(req, UnsafeOptions{})
+		require.Nil(t, resp, "a transport failure must produce no response")
+		require.Error(t, err)
+		rendered := err.Error()
+
+		// The two renderings, separated. Counted rather than matched as substrings so no
+		// assertion message can echo the credential (CWE-532) even when it fails.
+		require.Equal(t, 1, strings.Count(rendered, disclosureUserinfoUser+":"+disclosureUserinfoSecret+"@"),
+			"retryablehttp-go formats its prefix from the RAW request URL, so the password is rendered in cleartext exactly once and no redaction stands between it and the caller's log")
+		require.Equal(t, 1, strings.Count(rendered, disclosureUserinfoUser+":***@"),
+			"net/http renders its *url.Error through url.URL.Redacted(), so the inner cause carries the same credential with the password replaced - the redaction that the outer prefix defeats")
+		require.Equal(t, 2, strings.Count(rendered, disclosureUserinfoUser+":"),
+			"the USERNAME is disclosed by both layers: Redacted() replaces the password only, never the user")
+
+		// The password appears exactly once overall: cleartext in the prefix, redacted in
+		// the cause. Stated as a total so a change to either layer alone moves it.
+		require.Equal(t, 1, strings.Count(rendered, disclosureUserinfoSecret),
+			"the total number of cleartext password renderings in the caller-visible error is one, which is one more than a caller can safely log")
+
+		// The other components behave exactly as in the row above, so userinfo neither
+		// widens nor narrows their disclosure.
+		require.Equal(t, 2, strings.Count(rendered, disclosurePathSecret),
+			"userinfo does not change how the path is rendered")
+		require.Equal(t, 2, strings.Count(rendered, "apikey="+disclosureQuerySecret),
+			"userinfo does not change how the query is rendered")
+
+		// What the transport actually observed, which is the second half of the finding and
+		// the more alarming half. The credential is NOT stripped before the round trip: the
+		// snapshot of r.URL.String() still carries it, because net/http removes userinfo
+		// only when it serializes the request target - r.URL.RequestURI() yields
+		// "/reset/<token>?apikey=<key>" - and converts it into a Basic Authorization header
+		// at that point. So any round tripper, proxy hook or transport-level logger
+		// installed by a caller sees the cleartext password in the URL it is handed, which
+		// is precisely why this package's harness redacts before rendering anything.
+		require.Equal(t, 1, rt.callCount())
+		hops := rt.requests()
+		require.Len(t, hops, 1)
+		require.Equal(t, 1, strings.Count(hops[0].URL, disclosureUserinfoSecret),
+			"the URL handed to the round tripper still carries the cleartext password: net/http strips userinfo at SERIALIZATION time, not before RoundTrip, so a transport-level observer sees it")
+		require.Equal(t, credentialed, hops[0].URL,
+			"the round tripper observes the caller's target verbatim, userinfo and fragment included")
+		require.Equal(t, "origin.example", hops[0].Host,
+			"the authority is the bare host, so the credential travels in the URL object and the Authorization header rather than in the Host")
+		require.Equal(t,
+			"Basic "+base64.StdEncoding.EncodeToString([]byte(disclosureUserinfoUser+":"+disclosureUserinfoSecret)),
+			hops[0].Header.Get("Authorization"),
+			"net/http converts URL userinfo into a Basic credential, which is what keeps the SERIALIZED request target clean while the URL object is not")
+
+		// The harness tripwire, asserted rather than registered: it must have detected this
+		// exact combination, and its retained evidence must be credential-free. That is what
+		// lets every OTHER test in this package keep using newMockTransport safely.
+		leaks := rt.userinfoErrorLeaks()
+		require.Len(t, leaks, 1,
+			"the tripwire must record exactly one userinfo-bearing failed round trip, which is the combination it exists to report")
+		require.Equal(t, 0, strings.Count(leaks[0], disclosureUserinfoSecret),
+			"the tripwire's own retained evidence must not carry the password, or the guard would reproduce the leak it reports")
+		require.Equal(t, 0, strings.Count(leaks[0], disclosurePathSecret),
+			"the tripwire redacts the path as well, since a path segment alone is enough to disclose a capability token")
+		require.Equal(t, 0, strings.Count(leaks[0], disclosureQuerySecret),
+			"the tripwire redacts the query as well")
+		require.Equal(t, "GET http://origin.example/<redacted 2 segments, 16 bytes>?<redacted 15 bytes>#<redacted 8 bytes>", leaks[0],
+			"the retained evidence is the redacted request line in full: authority kept for attribution, every other component reduced to a size-only marker")
+	})
 }

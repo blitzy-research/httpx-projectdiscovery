@@ -493,6 +493,21 @@ const (
 //     as intentional so that case-sensitive APIs keep working. Neither half is this file's to
 //     change: the strip list belongs to the standard library and the exact casing is a
 //     documented feature of the strategy.
+//
+// AAP DISPOSITION for the two security-relevant outcomes above. Suppressing the Referer
+// disclosure means rewriting the header on an admitted redirect inside
+// common/httpx/httpx.go's CheckRedirect closure, or changing net/http's refererForURL;
+// withholding the custom auth header means changing net/http's cross-host strip list or
+// common/authprovider/authx. AAP section 0.8.1.3 authorises exactly two fixes in
+// common/httpx/httpx.go and no change to any other source file, section 0.8.2.1 places
+// anything further in httpx.go out of scope, section 0.8.2.6 puts standard-library behaviour
+// in the "asserted, not fixed" category, and section 0.4.5.4 already lists "a custom auth
+// header survives a cross-origin redirect" among the divergences deliberately not fixed.
+// Section 0.10.1.1 prescribes precisely the treatment used here: pin the current behaviour and
+// record the divergence rather than change it. A future engagement authorised to change the
+// redirect closure should suppress or sanitise the Referer for a cross-origin hop and withhold
+// non-allowlisted credential headers; the query and custom-header rows below then fail and
+// state the new contract.
 func TestAuthStrategiesAppliedThroughRedirect(t *testing.T) {
 	require.Equal(t,
 		"Basic "+base64.StdEncoding.EncodeToString([]byte(cookieAuthBasicUser+":"+cookieAuthBasicPassword)),
@@ -704,6 +719,19 @@ func cookieAuthSameOriginChainTransport(t *testing.T) *mockTransport {
 // hasCustomCookies is false, setCustomCookies returns without touching anything, and the hop
 // carries the foreign cookie ALONE. The loss on the configured rows is therefore the injector's
 // delete, not redirect handling dropping the header.
+//
+// AAP DISPOSITION. The delete is not incidental: AAP section 0.4.5.1 specifies FIX-1 verbatim as
+// the single statement req.Header.Del("Cookie") placed before the injection loop, and section
+// 0.8.1.3 caps the whole engagement's source change at that fix plus the read-cap guard. A
+// name-scoped merge - preserving inherited cookies whose names do not collide with the
+// configured set - was implemented earlier in this engagement (commits 3cfd5f4 and 0551435) and
+// deliberately REVERTED (commit 86e17e2) precisely because it exceeded that authorised
+// boundary, which section 0.8.2.1 states as "any change to common/httpx/httpx.go beyond the two
+// documented five-line fixes". The result is a functional trade-off the AAP boundary forces:
+// exact de-duplication, at the cost of inherited cookies the injector did not configure. It is
+// credential LOSS rather than credential disclosure, so no boundary is weakened by pinning it.
+// Reinstating the name-scoped merge requires an amended AAP; the exact per-hop rows below,
+// together with the two controls, are what make either outcome impossible to change silently.
 func assertCustomCookiesReplaceInheritedCookiesOnRedirectHops(t *testing.T) {
 	authxCookieStrategy := func(t *testing.T, req *retryablehttp.Request) {
 		t.Helper()
