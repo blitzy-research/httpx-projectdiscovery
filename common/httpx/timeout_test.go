@@ -44,12 +44,30 @@ const (
 	// and well below timeoutTransportSleep, so every case fails on the deadline rather
 	// than on the handler's safety valve. Every elapsed bound is expressed as a multiple
 	// of this value, so the envelopes scale with it rather than having to be retuned.
+	//
+	// CALIBRATION. This value also sets the file's irreducible cost, because six sub-cases
+	// each wait out one whole budget before asserting anything - one in
+	// TestTimeoutClientTimeoutErrorIdentity, three across the RetryMax sweep and two across
+	// the constructor parity rows - so 6*timeoutBudget + timeoutCancelAfter (about 0.66s
+	// here) is deliberate sleeping that no amount of host quiet can remove. It is kept this
+	// short so the file stays inside its runtime budget, and shortening it costs no
+	// assertion power at all, because the deadline is a fixture SCALE and never an asserted
+	// outcome: every elapsed bound is written relative to it, and the load-bearing
+	// assertions are exact counts (callCount() == 1, len(hops) == 1), the four error
+	// identity axes and the anti-per-attempt bound, all of which are scale-free. The floor
+	// is the overhead the call cannot avoid - client construction, request building and
+	// timer granularity, measured at 10-90ms even under 2-3x CPU oversubscription - which
+	// the envelope above still clears comfortably. Do NOT buy margin by raising
+	// timeoutEnvelopeFactor instead: that would weaken every upper bound in the file.
 	timeoutBudget = 100 * time.Millisecond
 
 	// timeoutCancelAfter is when the caller-driven cancellation fires, two orders of
 	// magnitude inside timeoutNoDeadline so a defect that let the client deadline end that
 	// call would blow the elapsed envelope rather than pass quietly. It also has to leave
 	// the call enough time to reach the transport, which the call-count assertion checks.
+	// Calibrated with timeoutBudget and for the same reason: it is the one remaining
+	// deliberate wait in the file, and both its lower bound and its envelope are written
+	// relative to it, so keeping it short loses nothing.
 	timeoutCancelAfter = 60 * time.Millisecond
 
 	// timeoutNoDeadline is the cancellation test's client timeout, deliberately far beyond
@@ -59,6 +77,11 @@ const (
 	// timeoutTransportSleep never actually elapses, because the handler's select returns
 	// as soon as the request context ends. It is the safety valve that turns "the deadline
 	// never fired" into a named failure instead of a hang.
+	//
+	// It therefore stays at 3s even though the deadlines above are deliberately short: it
+	// is free in wall time, and the separation is what makes the diagnostic branch a
+	// genuine safety valve rather than a race - 30x timeoutBudget and 50x
+	// timeoutCancelAfter. It must not be reduced alongside them.
 	timeoutTransportSleep = 3 * time.Second
 
 	// timeoutEnvelopeFactor widens every elapsed assertion to this multiple of the budget.
